@@ -2,10 +2,12 @@ import express from "express";
 import crypto from "crypto";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
+import cors from "cors";
 
 dotenv.config();
 
 const app = express();
+app.use(cors());
 app.use(express.json());
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
@@ -70,7 +72,42 @@ app.get("/api/meta/payout-options", async (_req, res) => {
   }
 });
 
-app.post("/api/verify-bank-account", requireGatewayToken, async (req, res) => {
+app.get("/api/verify-momo-account", async (req, res) => {
+  try {
+    const channel = String(req.query.channel || "").trim();
+    const phone = String(req.query.phone || "").trim();
+    if (!channel || !phone) {
+      return res.status(400).json({ error: "channel and phone are required" });
+    }
+    if (!GH_MOMO_CHANNELS.some((c) => c.id === channel)) {
+      return res.status(400).json({ error: "Unsupported momo channel" });
+    }
+    if (!process.env.HUBTEL_MERCHANT_ACCOUNT_NUMBER) {
+      return res.status(500).json({ error: "HUBTEL_MERCHANT_ACCOUNT_NUMBER is missing" });
+    }
+    const base = process.env.HUBTEL_RNV_BASE_URL || "https://rnv.hubtel.com";
+    const url = `${base}/merchantaccount/merchants/${encodeURIComponent(process.env.HUBTEL_MERCHANT_ACCOUNT_NUMBER)}/mobilemoney/verify?channel=${encodeURIComponent(channel)}&customerMsisdn=${encodeURIComponent(phone)}`;
+    const response = await fetch(url, {
+      method: "GET",
+      headers: { Authorization: hubtelAuthHeader() },
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      return res.status(response.status).json({ error: "Hubtel momo verification failed", details: data });
+    }
+    return res.json({
+      ok: true,
+      verified: data?.ResponseCode === "0000" && !!data?.Data?.IsRegistered,
+      account_name: data?.Data?.Name || null,
+      provider_status: data?.Data?.Status || null,
+      raw: data,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/verify-bank-account", async (req, res) => {
   try {
     const { bank_code, account_number } = req.body || {};
     if (!bank_code || !account_number) {

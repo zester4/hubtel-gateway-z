@@ -17,9 +17,17 @@ services:
         sync: false
       - key: HUBTEL_CLIENT_SECRET
         sync: false
+      - key: HUBTEL_MERCHANT_ACCOUNT_NUMBER
+        sync: false
       - key: HUBTEL_DISBURSEMENT_BASE_URL
         sync: false
       - key: HUBTEL_CALLBACK_URL
         sync: false
       - key: HUBTEL_WEBHOOK_SECRET
         sync: false
+      - key: HUBTEL_BANKS_URL
+        sync: false
+      - key: HUBTEL_BANK_VERIFY_URL
+        sync: false
+      - key: HUBTEL_RNV_BASE_URL
+        value: https://rnv.hubtel.com

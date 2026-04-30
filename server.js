@@ -61,9 +61,25 @@ app.get("/api/meta/payout-options", async (_req, res) => {
       banks = [
         { code: "GCB", name: "GCB Bank" },
         { code: "ECO", name: "Ecobank Ghana" },
+        { code: "ADB", name: "Agricultural Development Bank (ADB)" },
         { code: "CAL", name: "CalBank" },
         { code: "STB", name: "Stanbic Bank Ghana" },
         { code: "ABG", name: "Absa Bank Ghana" },
+        { code: "SCB", name: "Standard Chartered Bank Ghana" },
+        { code: "FBL", name: "Fidelity Bank Ghana" },
+        { code: "UMB", name: "Universal Merchant Bank (UMB)" },
+        { code: "NIB", name: "National Investment Bank (NIB)" },
+        { code: "PRU", name: "Prudential Bank" },
+        { code: "CMB", name: "Consolidated Bank Ghana (CBG)" },
+        { code: "RBL", name: "Republic Bank Ghana" },
+        { code: "ZEB", name: "Zenith Bank Ghana" },
+        { code: "GTB", name: "Guaranty Trust Bank (GTBank) Ghana" },
+        { code: "ACC", name: "Access Bank Ghana" },
+        { code: "SBG", name: "Societe Generale Ghana" },
+        { code: "FNB", name: "First National Bank Ghana" },
+        { code: "CBI", name: "Citi Bank Ghana" },
+        { code: "BOA", name: "Bank of Africa Ghana" },
+        { code: "UBA", name: "United Bank for Africa (UBA) Ghana" },
       ];
     }
     return res.json({ ok: true, momo_channels: GH_MOMO_CHANNELS, banks });

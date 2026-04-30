@@ -20,6 +20,8 @@ Use this service for Ghana-only Hubtel payout calls from a static-whitelisted `/
 
 - `GET /health`
 - `POST /api/disburse` (called by Supabase function)
+- `GET /api/meta/payout-options` (momo channels + banks list)
+- `POST /api/verify-bank-account` (account-name verification)
 - `POST /webhooks/hubtel` (Hubtel status callback)
 
 ## Security

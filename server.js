@@ -23,22 +23,121 @@ function hubtelAuthHeader() {
   return `Basic ${Buffer.from(raw).toString("base64")}`;
 }
 
+const GH_MOMO_CHANNELS = [
+  { id: "mtn-gh", label: "MTN Mobile Money" },
+  { id: "vodafone-gh", label: "Telecel Cash" },
+  { id: "tigo-gh", label: "AirtelTigo Money" },
+];
+
+async function fetchHubtelJson(url, body, method = "POST") {
+  const response = await fetch(url, {
+    method,
+    headers: {
+      Authorization: hubtelAuthHeader(),
+      "Content-Type": "application/json",
+    },
+    body: method === "GET" ? undefined : JSON.stringify(body || {}),
+  });
+  const data = await response.json().catch(() => ({}));
+  return { ok: response.ok, status: response.status, data };
+}
+
 app.get("/health", (_req, res) => res.json({ ok: true, service: "ziloshift-hubtel-gateway" }));
+
+app.get("/api/meta/payout-options", async (_req, res) => {
+  try {
+    let banks = [];
+    if (process.env.HUBTEL_BANKS_URL) {
+      const b = await fetchHubtelJson(process.env.HUBTEL_BANKS_URL, null, "GET");
+      const source = Array.isArray(b?.data?.Data) ? b.data.Data : Array.isArray(b?.data?.data) ? b.data.data : [];
+      banks = source.map((x) => ({
+        code: x.BankCode || x.code || x.bankCode || x.id || "",
+        name: x.BankName || x.name || x.bankName || "",
+      })).filter((x) => x.code && x.name);
+    }
+    if (!banks.length) {
+      banks = [
+        { code: "GCB", name: "GCB Bank" },
+        { code: "ECO", name: "Ecobank Ghana" },
+        { code: "CAL", name: "CalBank" },
+        { code: "STB", name: "Stanbic Bank Ghana" },
+        { code: "ABG", name: "Absa Bank Ghana" },
+      ];
+    }
+    return res.json({ ok: true, momo_channels: GH_MOMO_CHANNELS, banks });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/verify-bank-account", requireGatewayToken, async (req, res) => {
+  try {
+    const { bank_code, account_number } = req.body || {};
+    if (!bank_code || !account_number) {
+      return res.status(400).json({ error: "bank_code and account_number are required" });
+    }
+    if (!process.env.HUBTEL_BANK_VERIFY_URL) {
+      return res.json({
+        ok: true,
+        verified: false,
+        message: "Bank verification URL not configured. Set HUBTEL_BANK_VERIFY_URL.",
+      });
+    }
+    const vr = await fetchHubtelJson(process.env.HUBTEL_BANK_VERIFY_URL, { bank_code, account_number });
+    if (!vr.ok) return res.status(vr.status).json({ error: "Bank verification failed", details: vr.data });
+    const accountName =
+      vr.data?.Data?.AccountName ||
+      vr.data?.data?.account_name ||
+      vr.data?.account_name ||
+      vr.data?.accountName ||
+      null;
+    return res.json({
+      ok: true,
+      verified: Boolean(accountName),
+      account_name: accountName,
+      raw: vr.data,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
 
 app.post("/api/disburse", requireGatewayToken, async (req, res) => {
   try {
-    const { reference, amount, phone, currency = "GHS", worker_user_id, shift_id } = req.body || {};
-    if (!reference || !amount || !phone) {
-      return res.status(400).json({ error: "reference, amount, phone required" });
+    const { reference, amount, currency = "GHS", worker_user_id, shift_id, recipient } = req.body || {};
+    if (!reference || !amount || !recipient?.type) {
+      return res.status(400).json({ error: "reference, amount, recipient required" });
     }
-    const body = {
+    let body = {
       ClientReference: reference,
       Amount: Number(amount).toFixed(2),
       PrimaryCallbackUrl: process.env.HUBTEL_CALLBACK_URL,
       Description: `ZiloShift payout ${shift_id || ""}`.trim(),
-      Destination: phone,
-      Channel: "mtn-gh",
     };
+    if (recipient.type === "mobile_money") {
+      if (!recipient.phone || !recipient.provider) {
+        return res.status(400).json({ error: "mobile money recipient requires phone and provider" });
+      }
+      body = {
+        ...body,
+        Destination: recipient.phone,
+        Channel: recipient.provider,
+      };
+    } else if (recipient.type === "bank") {
+      if (!recipient.bank_code || !recipient.account_number) {
+        return res.status(400).json({ error: "bank recipient requires bank_code and account_number" });
+      }
+      body = {
+        ...body,
+        Destination: recipient.account_number,
+        Channel: "bank-gh",
+        BankCode: recipient.bank_code,
+        AccountNumber: recipient.account_number,
+        AccountName: recipient.account_name || undefined,
+      };
+    } else {
+      return res.status(400).json({ error: "Unsupported recipient type" });
+    }
     const response = await fetch(`${process.env.HUBTEL_DISBURSEMENT_BASE_URL}/v1/disburse`, {
       method: "POST",
       headers: {
@@ -65,7 +164,7 @@ app.post("/api/disburse", requireGatewayToken, async (req, res) => {
       type: "payment_update",
       icon: "wallet",
       deep_link: "/worker/earnings",
-      metadata: { reference, shift_id, provider: "hubtel" },
+      metadata: { reference, shift_id, provider: "hubtel", recipient_type: recipient.type },
     });
 
     return res.json({ ok: true, transaction_id: data?.Data?.TransactionId || data?.transactionId || null, raw: data });

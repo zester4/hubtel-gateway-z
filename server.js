@@ -68,10 +68,80 @@ function mapHubtelWebhookStatus(payload) {
   return "processing";
 }
 
+function mapHubtelCollectionStatus(payload) {
+  const rc = String(payload?.ResponseCode ?? payload?.responseCode ?? "").trim();
+  const data = payload?.Data ?? payload?.data ?? {};
+  const status = String(data?.Status ?? data?.status ?? payload?.Status ?? payload?.status ?? "").toLowerCase();
+  if (rc === "0000" || status === "paid" || status.includes("success")) return "captured";
+  if (rc === "0001" || status.includes("pending")) return "processing";
+  if (rc) return "failed";
+  return "processing";
+}
+
+function preapprovalBaseUrl() {
+  return (process.env.HUBTEL_PREAPPROVAL_BASE_URL || "https://preapproval.hubtel.com").replace(/\/$/, "");
+}
+
+function receiveMoneyBaseUrl() {
+  return (process.env.HUBTEL_RECEIVE_MONEY_BASE_URL || "https://rmp.hubtel.com").replace(/\/$/, "");
+}
+
+function requireCollectionAccount() {
+  if (!process.env.HUBTEL_MERCHANT_ACCOUNT_NUMBER) {
+    throw new Error("HUBTEL_MERCHANT_ACCOUNT_NUMBER missing");
+  }
+  return process.env.HUBTEL_MERCHANT_ACCOUNT_NUMBER;
+}
+
+function requireDisbursementAccount() {
+  if (!process.env.HUBTEL_DISBURSEMENT_ACCOUNT_NUMBER) {
+    throw new Error("HUBTEL_DISBURSEMENT_ACCOUNT_NUMBER missing (Hubtel disbursement account)");
+  }
+  return process.env.HUBTEL_DISBURSEMENT_ACCOUNT_NUMBER;
+}
+
+function callbackUrl() {
+  const url = process.env.HUBTEL_CALLBACK_URL;
+  if (!url) throw new Error("HUBTEL_CALLBACK_URL is required");
+  return url;
+}
+
 const GH_MOMO_CHANNELS = [
   { id: "mtn-gh", label: "MTN Mobile Money" },
   { id: "vodafone-gh", label: "Telecel Cash" },
   { id: "tigo-gh", label: "AirtelTigo Money" },
+];
+
+const GH_DIRECT_DEBIT_CHANNELS = [
+  { id: "mtn-gh-direct-debit", label: "MTN Mobile Money" },
+  { id: "vodafone-gh-direct-debit", label: "Telecel Cash" },
+];
+
+const GH_BANKS = [
+  { code: "300302", name: "Standard Chartered Bank" },
+  { code: "300303", name: "Absa Bank Ghana Limited" },
+  { code: "300304", name: "GCB Bank Limited" },
+  { code: "300305", name: "National Investment Bank" },
+  { code: "300306", name: "ARB Apex Bank Limited" },
+  { code: "300307", name: "Agricultural Development Bank" },
+  { code: "300309", name: "Universal Merchant Bank" },
+  { code: "300310", name: "Republic Bank Limited" },
+  { code: "300311", name: "Zenith Bank Ghana Ltd" },
+  { code: "300312", name: "Ecobank Ghana Ltd" },
+  { code: "300313", name: "Cal Bank Limited" },
+  { code: "300316", name: "First Atlantic Bank" },
+  { code: "300317", name: "Prudential Bank Ltd" },
+  { code: "300318", name: "Stanbic Bank" },
+  { code: "300319", name: "First Bank of Nigeria" },
+  { code: "300320", name: "Bank of Africa" },
+  { code: "300322", name: "Guaranty Trust Bank" },
+  { code: "300323", name: "Fidelity Bank Limited" },
+  { code: "300324", name: "Sahel - Sahara Bank (BSIC)" },
+  { code: "300325", name: "United Bank of Africa" },
+  { code: "300329", name: "Access Bank Ltd" },
+  { code: "300331", name: "Consolidated Bank Ghana" },
+  { code: "300334", name: "First National Bank" },
+  { code: "300362", name: "GHL Bank" },
 ];
 
 async function fetchHubtelJson(url, body, method = "POST") {
@@ -100,32 +170,8 @@ app.get("/api/meta/payout-options", async (_req, res) => {
         name: x.BankName || x.name || x.bankName || "",
       })).filter((x) => x.code && x.name);
     }
-    if (!banks.length) {
-      banks = [
-        { code: "GCB", name: "GCB Bank" },
-        { code: "ECO", name: "Ecobank Ghana" },
-        { code: "ADB", name: "Agricultural Development Bank (ADB)" },
-        { code: "CAL", name: "CalBank" },
-        { code: "STB", name: "Stanbic Bank Ghana" },
-        { code: "ABG", name: "Absa Bank Ghana" },
-        { code: "SCB", name: "Standard Chartered Bank Ghana" },
-        { code: "FBL", name: "Fidelity Bank Ghana" },
-        { code: "UMB", name: "Universal Merchant Bank (UMB)" },
-        { code: "NIB", name: "National Investment Bank (NIB)" },
-        { code: "PRU", name: "Prudential Bank" },
-        { code: "CMB", name: "Consolidated Bank Ghana (CBG)" },
-        { code: "RBL", name: "Republic Bank Ghana" },
-        { code: "ZEB", name: "Zenith Bank Ghana" },
-        { code: "GTB", name: "Guaranty Trust Bank (GTBank) Ghana" },
-        { code: "ACC", name: "Access Bank Ghana" },
-        { code: "SBG", name: "Societe Generale Ghana" },
-        { code: "FNB", name: "First National Bank Ghana" },
-        { code: "CBI", name: "Citi Bank Ghana" },
-        { code: "BOA", name: "Bank of Africa Ghana" },
-        { code: "UBA", name: "United Bank for Africa (UBA) Ghana" },
-      ];
-    }
-    return res.json({ ok: true, momo_channels: GH_MOMO_CHANNELS, banks });
+    if (!banks.length) banks = GH_BANKS;
+    return res.json({ ok: true, momo_channels: GH_MOMO_CHANNELS, direct_debit_channels: GH_DIRECT_DEBIT_CHANNELS, banks });
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
@@ -198,6 +244,165 @@ app.post("/api/verify-bank-account", async (req, res) => {
   }
 });
 
+app.post("/api/direct-debit/preapproval/initiate", requireGatewayToken, async (req, res) => {
+  try {
+    const { reference, venue_id, venue_user_id, customer_msisdn, channel, customer_name } = req.body || {};
+    if (!reference || !venue_id || !venue_user_id || !customer_msisdn || !channel) {
+      return res.status(400).json({ error: "reference, venue_id, venue_user_id, customer_msisdn, and channel are required" });
+    }
+    if (!GH_DIRECT_DEBIT_CHANNELS.some((c) => c.id === channel)) {
+      return res.status(400).json({ error: "Unsupported direct debit channel" });
+    }
+
+    const collection = requireCollectionAccount();
+    const clientReferenceId = hubtelDisburseClientReference(reference);
+    const customerMsisdn = normalizeGhMsisdn(customer_msisdn);
+    const url = `${preapprovalBaseUrl()}/api/v2/merchant/${encodeURIComponent(collection)}/preapproval/initiate`;
+    const body = {
+      clientReferenceId,
+      customerMsisdn,
+      channel,
+      callbackUrl: callbackUrl(),
+    };
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: hubtelAuthHeader(), "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) return res.status(response.status).json({ error: "Hubtel preapproval initiate failed", details: data });
+    const rc = String(data?.responseCode ?? data?.ResponseCode ?? "");
+    if (rc && rc !== "2000") return res.status(400).json({ error: "Hubtel preapproval was not accepted", responseCode: rc, details: data });
+
+    const d = data?.data ?? data?.Data ?? {};
+    await supabase.from("venues").update({
+      stripe_onboarding_complete: false,
+      hubtel_billing_type: "mobile_money_direct_debit",
+      hubtel_direct_debit_channel: channel,
+      hubtel_direct_debit_msisdn: customerMsisdn,
+      hubtel_direct_debit_account_name: customer_name || null,
+      hubtel_preapproval_reference: clientReferenceId,
+      hubtel_preapproval_id: d.hubtelPreApprovalId || d.hubtelPreapprovalId || null,
+      hubtel_preapproval_status: d.preapprovalStatus || "PENDING",
+    }).eq("id", venue_id).eq("user_id", venue_user_id);
+
+    return res.json({
+      ok: true,
+      reference: clientReferenceId,
+      hubtel_preapproval_id: d.hubtelPreApprovalId || d.hubtelPreapprovalId || null,
+      verification_type: d.verificationType || null,
+      otp_prefix: d.otpPrefix || null,
+      preapproval_status: d.preapprovalStatus || "PENDING",
+      raw: data,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/direct-debit/preapproval/verify-otp", requireGatewayToken, async (req, res) => {
+  try {
+    const { venue_id, venue_user_id, customer_msisdn, hubtel_preapproval_id, reference, otp_code } = req.body || {};
+    if (!venue_id || !venue_user_id || !customer_msisdn || !hubtel_preapproval_id || !reference || !otp_code) {
+      return res.status(400).json({ error: "venue_id, venue_user_id, customer_msisdn, hubtel_preapproval_id, reference, and otp_code are required" });
+    }
+    const collection = requireCollectionAccount();
+    const url = `${preapprovalBaseUrl()}/api/v2/merchant/${encodeURIComponent(collection)}/preapproval/verifyotp`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: hubtelAuthHeader(), "Content-Type": "application/json" },
+      body: JSON.stringify({
+        customerMsisdn: normalizeGhMsisdn(customer_msisdn),
+        hubtelPreApprovalId: hubtel_preapproval_id,
+        clientReferenceId: reference,
+        otpCode: otp_code,
+      }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) return res.status(response.status).json({ error: "Hubtel OTP verification failed", details: data });
+    const rc = String(data?.responseCode ?? data?.ResponseCode ?? "");
+    if (rc && rc !== "2000") return res.status(400).json({ error: "Hubtel OTP verification was not accepted", responseCode: rc, details: data });
+    const d = data?.data ?? data?.Data ?? {};
+    await supabase.from("venues").update({
+      hubtel_preapproval_status: d.preapprovalStatus || "PENDING",
+      hubtel_preapproval_id: d.hubtelPreApprovalId || d.hubtelPreapprovalId || hubtel_preapproval_id,
+    }).eq("id", venue_id).eq("user_id", venue_user_id);
+    return res.json({ ok: true, preapproval_status: d.preapprovalStatus || "PENDING", raw: data });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/direct-debit/preapproval/status", requireGatewayToken, async (req, res) => {
+  try {
+    const reference = req.query.clientReferenceId || req.query.reference;
+    if (!reference) return res.status(400).json({ error: "reference is required" });
+    const collection = requireCollectionAccount();
+    const url = `${preapprovalBaseUrl()}/api/v2/merchant/${encodeURIComponent(collection)}/preapproval/${encodeURIComponent(String(reference))}/status`;
+    const response = await fetch(url, { method: "GET", headers: { Authorization: hubtelAuthHeader(), Accept: "application/json" } });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) return res.status(response.status).json({ error: "Hubtel preapproval status failed", details: data });
+    return res.json({ ok: true, raw: data });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/direct-debit/charge", requireGatewayToken, async (req, res) => {
+  try {
+    const { reference, amount, venue_id, venue_user_id, worker_user_id, shift_id, customer_msisdn, channel, customer_name, customer_email } = req.body || {};
+    if (!reference || amount == null || !venue_id || !venue_user_id || !customer_msisdn || !channel) {
+      return res.status(400).json({ error: "reference, amount, venue_id, venue_user_id, customer_msisdn, and channel are required" });
+    }
+    if (!GH_DIRECT_DEBIT_CHANNELS.some((c) => c.id === channel)) {
+      return res.status(400).json({ error: "Unsupported direct debit channel" });
+    }
+    const collection = requireCollectionAccount();
+    const clientReference = hubtelDisburseClientReference(reference);
+    const amountNum = Number(Number(amount).toFixed(2));
+    const url = `${receiveMoneyBaseUrl()}/merchantaccount/merchants/${encodeURIComponent(collection)}/receive/mobilemoney`;
+    const body = {
+      CustomerName: customer_name || "ZiloShift venue",
+      CustomerMsisdn: normalizeGhMsisdn(customer_msisdn),
+      CustomerEmail: customer_email || undefined,
+      Channel: channel,
+      Amount: amountNum,
+      PrimaryCallbackUrl: callbackUrl(),
+      Description: `ZiloShift shift ${shift_id || ""}`.trim(),
+      ClientReference: clientReference,
+    };
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: hubtelAuthHeader(), "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) return res.status(response.status).json({ error: "Hubtel direct debit charge failed", details: data });
+    const rc = String(data?.ResponseCode ?? data?.responseCode ?? "");
+    if (rc && rc !== "0001" && rc !== "0000") {
+      return res.status(400).json({ error: "Hubtel direct debit was not accepted", responseCode: rc, details: data });
+    }
+    const transactionId = data?.Data?.TransactionId ?? data?.data?.transactionId ?? null;
+    await supabase.from("payments").update({
+      status: rc === "0000" ? "captured" : "processing",
+      collection_provider: "hubtel_direct_debit",
+      collection_reference: clientReference,
+      collection_external_id: transactionId != null ? String(transactionId) : null,
+      payout_provider: "hubtel_disbursement",
+    }).eq("shift_id", shift_id).eq("venue_user_id", venue_user_id);
+
+    return res.json({
+      ok: true,
+      status: rc === "0000" ? "captured" : "processing",
+      transaction_id: transactionId != null ? String(transactionId) : null,
+      client_reference: clientReference,
+      raw: data,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
 app.post("/api/preauth", requireGatewayToken, async (req, res) => {
   try {
     const { reference, amount = "1.00", currency = "GHS", description, return_url, venue_user_id, venue_id } = req.body || {};
@@ -262,107 +467,98 @@ app.post("/api/preauth", requireGatewayToken, async (req, res) => {
   }
 });
 
-app.post("/api/disburse", requireGatewayToken, async (req, res) => {
-  try {
-    const { reference, amount, currency = "GHS", worker_user_id, shift_id, recipient } = req.body || {};
-    if (!reference || amount == null || !recipient?.type) {
-      return res.status(400).json({ error: "reference, amount, recipient required" });
-    }
-    if (!process.env.HUBTEL_CALLBACK_URL) {
-      return res.status(500).json({ error: "HUBTEL_CALLBACK_URL is required for disbursement callbacks" });
-    }
-    const disburseAccount = process.env.HUBTEL_DISBURSEMENT_ACCOUNT_NUMBER;
-    if (!disburseAccount) {
-      return res.status(500).json({ error: "HUBTEL_DISBURSEMENT_ACCOUNT_NUMBER missing (Hubtel disbursement account)" });
-    }
+async function initiateHubtelDisbursement({ reference, amount, currency = "GHS", worker_user_id, shift_id, recipient, payment_id }) {
+  callbackUrl();
+  const disburseAccount = requireDisbursementAccount();
+  const clientReference = hubtelDisburseClientReference(reference);
+  const description = `ZiloShift payout ${shift_id || ""}`.trim() || "ZiloShift payout";
+  const amountNum = Number(Number(amount).toFixed(2));
 
-    const clientReference = hubtelDisburseClientReference(reference);
-    const description = `ZiloShift payout ${shift_id || ""}`.trim() || "ZiloShift payout";
-    const amountNum = Number(Number(amount).toFixed(2));
+  let url;
+  let body;
 
-    let url;
-    let body;
-
-    if (recipient.type === "mobile_money") {
-      if (!recipient.phone || !recipient.provider) {
-        return res.status(400).json({ error: "mobile money recipient requires phone and provider" });
-      }
-      const msisdn = normalizeGhMsisdn(recipient.phone);
-      if (!msisdn || msisdn.length < 12) {
-        return res.status(400).json({ error: "Invalid Ghana mobile money number (use international format, e.g. 233XXXXXXXXX)" });
-      }
-      const recipientName = String(recipient.account_name || recipient.phone || "Recipient").trim().slice(0, 120);
-      url =
-        process.env.HUBTEL_SEND_MONEY_URL ||
-        `https://smp.hubtel.com/api/merchants/${encodeURIComponent(disburseAccount)}/send/mobilemoney`;
-      body = {
-        RecipientName: recipientName,
-        RecipientMsisdn: msisdn,
-        Channel: recipient.provider,
-        Amount: amountNum,
-        PrimaryCallbackURL: process.env.HUBTEL_CALLBACK_URL,
-        Description: description,
-        ClientReference: clientReference,
-      };
-      if (recipient.customer_email) body.CustomerEmail = recipient.customer_email;
-    } else if (recipient.type === "bank") {
-      if (!recipient.bank_code || !recipient.account_number) {
-        return res.status(400).json({ error: "bank recipient requires bank_code and account_number" });
-      }
-      url =
-        process.env.HUBTEL_SEND_TO_BANK_URL_TEMPLATE?.replace("{BankCode}", encodeURIComponent(recipient.bank_code)) ||
-        `https://smp.hubtel.com/api/merchants/${encodeURIComponent(disburseAccount)}/send/bank/gh/${encodeURIComponent(recipient.bank_code)}`;
-      body = {
-        Amount: amountNum,
-        PrimaryCallbackUrl: process.env.HUBTEL_CALLBACK_URL,
-        Description: description,
-        BankAccountNumber: String(recipient.account_number),
-        ClientReference: clientReference,
-        BankAccountName: recipient.account_name || "",
-        BankName: recipient.bank_name || "",
-        BankBranch: recipient.bank_branch || "",
-        BankBranchCode: recipient.bank_branch_code || "",
-        RecipientPhoneNumber: recipient.phone ? normalizeGhMsisdn(recipient.phone) : "",
-      };
-    } else {
-      return res.status(400).json({ error: "Unsupported recipient type" });
-    }
-
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: hubtelAuthHeader(),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-    });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      return res.status(response.status).json({ error: "Hubtel disbursement rejected", details: data });
-    }
-
-    const rc = String(data?.ResponseCode ?? data?.responseCode ?? "");
-    const okAccepted = rc === "0001" || rc === "0000";
-
-    if (!okAccepted && rc) {
-      return res.status(400).json({ error: "Hubtel did not accept disbursement", responseCode: rc, details: data });
-    }
-
-    const transactionIdRaw =
-      data?.Data?.TransactionId ?? data?.data?.transactionId ?? data?.TransactionId ?? null;
-    const transactionId = transactionIdRaw != null ? String(transactionIdRaw) : null;
-
-    const payoutPatch = {
-      payout_provider: "hubtel_disbursement",
-      payout_external_id: transactionId,
-      status: "processing",
+  if (recipient.type === "mobile_money") {
+    if (!recipient.phone || !recipient.provider) throw new Error("mobile money recipient requires phone and provider");
+    const msisdn = normalizeGhMsisdn(recipient.phone);
+    if (!msisdn || msisdn.length < 12) throw new Error("Invalid Ghana mobile money number (use international format, e.g. 233XXXXXXXXX)");
+    const recipientName = String(recipient.account_name || recipient.phone || "Recipient").trim().slice(0, 120);
+    url =
+      process.env.HUBTEL_SEND_MONEY_URL ||
+      `https://smp.hubtel.com/api/merchants/${encodeURIComponent(disburseAccount)}/send/mobilemoney`;
+    body = {
+      RecipientName: recipientName,
+      RecipientMsisdn: msisdn,
+      Channel: recipient.provider,
+      Amount: amountNum,
+      PrimaryCallbackURL: process.env.HUBTEL_CALLBACK_URL,
+      Description: description,
+      ClientReference: clientReference,
     };
-    if (clientReference !== reference) {
-      payoutPatch.payout_reference = clientReference;
-    }
+    if (recipient.customer_email) body.CustomerEmail = recipient.customer_email;
+  } else if (recipient.type === "bank") {
+    if (!recipient.bank_code || !recipient.account_number) throw new Error("bank recipient requires bank_code and account_number");
+    url =
+      process.env.HUBTEL_SEND_TO_BANK_URL_TEMPLATE?.replace("{BankCode}", encodeURIComponent(recipient.bank_code)) ||
+      `https://smp.hubtel.com/api/merchants/${encodeURIComponent(disburseAccount)}/send/bank/gh/${encodeURIComponent(recipient.bank_code)}`;
+    body = {
+      Amount: amountNum,
+      PrimaryCallbackUrl: process.env.HUBTEL_CALLBACK_URL,
+      Description: description,
+      BankAccountNumber: String(recipient.account_number),
+      ClientReference: clientReference,
+      BankAccountName: recipient.account_name || "",
+      BankName: recipient.bank_name || "",
+      BankBranch: recipient.bank_branch || "",
+      BankBranchCode: recipient.bank_branch_code || "",
+      RecipientPhoneNumber: recipient.phone ? normalizeGhMsisdn(recipient.phone) : "",
+    };
+  } else {
+    throw new Error("Unsupported recipient type");
+  }
 
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: hubtelAuthHeader(),
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const err = new Error("Hubtel disbursement rejected");
+    err.details = data;
+    err.status = response.status;
+    throw err;
+  }
+
+  const rc = String(data?.ResponseCode ?? data?.responseCode ?? "");
+  const okAccepted = rc === "0001" || rc === "0000";
+  if (!okAccepted && rc) {
+    const err = new Error("Hubtel did not accept disbursement");
+    err.details = data;
+    err.status = 400;
+    throw err;
+  }
+
+  const transactionIdRaw =
+    data?.Data?.TransactionId ?? data?.data?.transactionId ?? data?.TransactionId ?? null;
+  const transactionId = transactionIdRaw != null ? String(transactionIdRaw) : null;
+
+  const payoutPatch = {
+    payout_provider: "hubtel_disbursement",
+    payout_external_id: transactionId,
+    payout_reference: clientReference,
+    status: rc === "0000" ? "paid_out" : "processing",
+  };
+
+  if (payment_id) {
+    await supabase.from("payments").update(payoutPatch).eq("id", payment_id);
+  } else {
     await supabase.from("payments").update(payoutPatch).eq("payout_reference", reference);
+  }
 
+  if (worker_user_id) {
     await supabase.from("notifications").insert({
       user_id: worker_user_id,
       title: "Payout processing",
@@ -372,15 +568,27 @@ app.post("/api/disburse", requireGatewayToken, async (req, res) => {
       deep_link: "/worker/earnings",
       metadata: { reference: clientReference, shift_id, provider: "hubtel", recipient_type: recipient.type },
     });
+  }
+
+  return { transactionId, clientReference, data };
+}
+
+app.post("/api/disburse", requireGatewayToken, async (req, res) => {
+  try {
+    const { reference, amount, currency = "GHS", worker_user_id, shift_id, recipient } = req.body || {};
+    if (!reference || amount == null || !recipient?.type) {
+      return res.status(400).json({ error: "reference, amount, recipient required" });
+    }
+    const result = await initiateHubtelDisbursement({ reference, amount, currency, worker_user_id, shift_id, recipient });
 
     return res.json({
       ok: true,
-      transaction_id: transactionId,
-      client_reference: clientReference,
-      raw: data,
+      transaction_id: result.transactionId,
+      client_reference: result.clientReference,
+      raw: result.data,
     });
   } catch (error) {
-    return res.status(500).json({ error: error.message });
+    return res.status(error.status || 500).json({ error: error.message, details: error.details });
   }
 });
 
@@ -452,6 +660,8 @@ app.post("/webhooks/hubtel", async (req, res) => {
     const clientReference =
       data.ClientReference ??
       data.clientReference ??
+      payload.ClientReferenceId ??
+      payload.clientReferenceId ??
       payload.ClientReference ??
       payload.clientReference;
     const transactionId =
@@ -460,17 +670,101 @@ app.post("/webhooks/hubtel", async (req, res) => {
       payload.TransactionId ??
       payload.transactionId;
 
-    const status = mapHubtelWebhookStatus(payload);
+    const preapprovalReference = payload.ClientReferenceId ?? payload.clientReferenceId;
+    const preapprovalStatus = payload.PreapprovalStatus ?? payload.preapprovalStatus;
+    if (preapprovalReference && preapprovalStatus) {
+      const approved = String(preapprovalStatus).toUpperCase() === "APPROVED";
+      await supabase.from("venues").update({
+        stripe_onboarding_complete: approved,
+        hubtel_preapproval_status: String(preapprovalStatus).toUpperCase(),
+        hubtel_preapproval_id: payload.HubtelPreapprovalId ?? payload.HubtelPreApprovalId ?? payload.hubtelPreapprovalId ?? null,
+      }).eq("hubtel_preapproval_reference", String(preapprovalReference));
+      return res.json({ ok: true });
+    }
 
     if (!clientReference && transactionId == null) {
       return res.json({ ok: true });
     }
 
+    let collectionPayment = null;
+    if (clientReference) {
+      const { data: byCollection } = await supabase
+        .from("payments")
+        .select("*")
+        .eq("collection_reference", String(clientReference))
+        .maybeSingle();
+      collectionPayment = byCollection || null;
+    }
+    if (!collectionPayment && transactionId != null) {
+      const { data: byCollectionId } = await supabase
+        .from("payments")
+        .select("*")
+        .eq("collection_external_id", String(transactionId))
+        .maybeSingle();
+      collectionPayment = byCollectionId || null;
+    }
+
+    if (collectionPayment) {
+      const collectionStatus = mapHubtelCollectionStatus(payload);
+      await supabase.from("payments").update({
+        status: collectionStatus,
+        collection_external_id: transactionId != null ? String(transactionId) : collectionPayment.collection_external_id,
+      }).eq("id", collectionPayment.id);
+
+      if (collectionStatus === "captured" && collectionPayment.worker_user_id && Number(collectionPayment.worker_payout) > 0) {
+        const { data: worker } = await supabase
+          .from("workers")
+          .select("hubtel_payout_type, hubtel_mobile_provider, hubtel_mobile_number, hubtel_mobile_account_name, hubtel_bank_code, hubtel_bank_name, hubtel_bank_account_number, hubtel_bank_account_name")
+          .eq("user_id", collectionPayment.worker_user_id)
+          .maybeSingle();
+        const recipient = worker?.hubtel_payout_type === "bank"
+          ? {
+            type: "bank",
+            bank_code: worker?.hubtel_bank_code || null,
+            bank_name: worker?.hubtel_bank_name || null,
+            account_number: worker?.hubtel_bank_account_number || null,
+            account_name: worker?.hubtel_bank_account_name || null,
+          }
+          : {
+            type: "mobile_money",
+            provider: worker?.hubtel_mobile_provider || "mtn-gh",
+            phone: worker?.hubtel_mobile_number || null,
+            account_name: worker?.hubtel_mobile_account_name || null,
+          };
+        try {
+          await initiateHubtelDisbursement({
+            reference: `zpo_${String(collectionPayment.shift_id || collectionPayment.id).replace(/-/g, "").slice(0, 14)}_${Date.now().toString(36)}`,
+            amount: collectionPayment.worker_payout,
+            currency: collectionPayment.currency || "GHS",
+            worker_user_id: collectionPayment.worker_user_id,
+            shift_id: collectionPayment.shift_id,
+            recipient,
+            payment_id: collectionPayment.id,
+          });
+        } catch (payoutError) {
+          await supabase.from("payments").update({ status: "failed" }).eq("id", collectionPayment.id);
+          console.error("Hubtel payout after collection failed:", payoutError);
+        }
+      }
+
+      return res.json({ ok: true });
+    }
+
+    const status = mapHubtelWebhookStatus(payload);
+    if (clientReference) {
+      const { data: payoutPayment } = await supabase
+        .from("payments")
+        .select("id,payout_provider")
+        .eq("payout_reference", String(clientReference))
+        .maybeSingle();
+      if (payoutPayment?.payout_provider === "hubtel_preauth") {
+        await supabase.from("payments").update({ status: status === "paid_out" ? "captured" : status }).eq("id", payoutPayment.id);
+      } else {
+        await supabase.from("payments").update({ status }).eq("payout_reference", String(clientReference));
+      }
+    }
     if (transactionId != null) {
       await supabase.from("payments").update({ status }).eq("payout_external_id", String(transactionId));
-    }
-    if (clientReference) {
-      await supabase.from("payments").update({ status }).eq("payout_reference", String(clientReference));
     }
 
     return res.json({ ok: true });

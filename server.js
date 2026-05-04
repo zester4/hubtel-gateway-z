@@ -1,3 +1,4 @@
+//server.js
 import express from "express";
 import crypto from "crypto";
 import dotenv from "dotenv";
@@ -403,9 +404,27 @@ app.post("/api/direct-debit/charge", requireGatewayToken, async (req, res) => {
   }
 });
 
-app.post("/api/preauth", requireGatewayToken, async (req, res) => {
+app.post("/api/checkout/initiate", requireGatewayToken, async (req, res) => {
   try {
-    const { reference, amount = "1.00", currency = "GHS", description, return_url, venue_user_id, venue_id } = req.body || {};
+    const {
+      reference,
+      amount = "1.00",
+      currency = "GHS",
+      description,
+      return_url,
+      cancellation_url,
+      venue_user_id,
+      venue_id,
+      shift_id,
+      worker_user_id,
+      worker_payout,
+      platform_fee,
+      payment_id,
+      purpose = "venue_billing_setup",
+      payee_name,
+      payee_mobile_number,
+      payee_email,
+    } = req.body || {};
     if (!reference) return res.status(400).json({ error: "reference is required" });
     if (!process.env.HUBTEL_MERCHANT_ACCOUNT_NUMBER) {
       return res.status(500).json({ error: "HUBTEL_MERCHANT_ACCOUNT_NUMBER missing" });
@@ -424,10 +443,12 @@ app.post("/api/preauth", requireGatewayToken, async (req, res) => {
       callbackUrl: callback,
       returnUrl: return_url,
       merchantAccountNumber: process.env.HUBTEL_MERCHANT_ACCOUNT_NUMBER,
-      cancellationUrl: return_url,
+      cancellationUrl: cancellation_url || return_url,
       clientReference,
-      payeeName: "ZiloShift",
+      payeeName: payee_name || "ZiloShift",
     };
+    if (payee_mobile_number) body.payeeMobileNumber = normalizeGhMsisdn(payee_mobile_number);
+    if (payee_email) body.payeeEmail = payee_email;
     const r = await fetch(checkoutInitiateUrl(), {
       method: "POST",
       headers: { Authorization: hubtelAuthHeader(), "Content-Type": "application/json" },
@@ -445,21 +466,56 @@ app.post("/api/preauth", requireGatewayToken, async (req, res) => {
       data?.Data?.CheckoutUrl ||
       data?.checkoutUrl ||
       null;
+    const checkoutDirectUrl =
+      data?.data?.checkoutDirectUrl ||
+      data?.Data?.CheckoutDirectUrl ||
+      data?.checkoutDirectUrl ||
+      null;
+    const checkoutId =
+      data?.data?.checkoutId ||
+      data?.Data?.CheckoutId ||
+      data?.checkoutId ||
+      null;
 
-    await supabase.from("payments").insert({
+    const paymentPatch = {
       venue_user_id: venue_user_id || null,
-      payout_provider: "hubtel_preauth",
-      payout_reference: clientReference,
+      worker_user_id: worker_user_id || null,
+      shift_id: shift_id || null,
+      collection_provider: purpose === "venue_billing_setup" ? "hubtel_checkout_setup" : "hubtel_checkout",
+      collection_reference: clientReference,
+      collection_external_id: checkoutId != null ? String(checkoutId) : null,
+      payout_provider: purpose === "shift_collection" ? "hubtel_disbursement" : "hubtel_checkout_setup",
+      payout_reference: purpose === "venue_billing_setup" ? clientReference : null,
       amount: Number(amount),
+      platform_fee: Number(platform_fee || 0),
+      worker_amount: Number(worker_payout || 0),
+      worker_payout: Number(worker_payout || 0),
       currency,
       status: "pending",
-    });
+    };
+
+    if (payment_id) {
+      await supabase.from("payments").update(paymentPatch).eq("id", payment_id);
+    } else {
+      await supabase.from("payments").insert(paymentPatch);
+    }
+
+    if (purpose === "venue_billing_setup" && venue_id && venue_user_id) {
+      await supabase.from("venues").update({
+        stripe_onboarding_complete: false,
+        hubtel_billing_type: "online_checkout",
+      }).eq("id", venue_id).eq("user_id", venue_user_id);
+    }
 
     return res.json({
       ok: true,
       checkout_url: checkoutUrl,
+      checkout_direct_url: checkoutDirectUrl,
+      checkout_id: checkoutId,
       reference: clientReference,
-      message: "₵1 will be charged then refunded automatically once authorised.",
+      message: purpose === "venue_billing_setup"
+        ? "Open Hubtel Checkout to verify your billing profile with any supported payment option."
+        : "Open Hubtel Checkout to complete payment for this shift.",
       raw: data,
     });
   } catch (error) {
@@ -711,6 +767,14 @@ app.post("/webhooks/hubtel", async (req, res) => {
         collection_external_id: transactionId != null ? String(transactionId) : collectionPayment.collection_external_id,
       }).eq("id", collectionPayment.id);
 
+      if (collectionStatus === "captured" && collectionPayment.collection_provider === "hubtel_checkout_setup" && collectionPayment.venue_user_id) {
+        await supabase.from("venues").update({
+          stripe_onboarding_complete: true,
+          hubtel_billing_type: "online_checkout",
+        }).eq("user_id", collectionPayment.venue_user_id);
+        return res.json({ ok: true });
+      }
+
       if (collectionStatus === "captured" && collectionPayment.worker_user_id && Number(collectionPayment.worker_payout) > 0) {
         const { data: worker } = await supabase
           .from("workers")
@@ -757,8 +821,22 @@ app.post("/webhooks/hubtel", async (req, res) => {
         .select("id,payout_provider")
         .eq("payout_reference", String(clientReference))
         .maybeSingle();
-      if (payoutPayment?.payout_provider === "hubtel_preauth") {
-        await supabase.from("payments").update({ status: status === "paid_out" ? "captured" : status }).eq("id", payoutPayment.id);
+      if (payoutPayment?.payout_provider === "hubtel_preauth" || payoutPayment?.payout_provider === "hubtel_checkout_setup") {
+        const setupStatus = status === "paid_out" ? "captured" : status;
+        await supabase.from("payments").update({ status: setupStatus }).eq("id", payoutPayment.id);
+        if (setupStatus === "captured") {
+          const { data: setupPayment } = await supabase
+            .from("payments")
+            .select("venue_user_id")
+            .eq("id", payoutPayment.id)
+            .maybeSingle();
+          if (setupPayment?.venue_user_id) {
+            await supabase.from("venues").update({
+              stripe_onboarding_complete: true,
+              hubtel_billing_type: "online_checkout",
+            }).eq("user_id", setupPayment.venue_user_id);
+          }
+        }
       } else {
         await supabase.from("payments").update({ status }).eq("payout_reference", String(clientReference));
       }

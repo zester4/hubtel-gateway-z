@@ -19,9 +19,23 @@ services:
         sync: false
       - key: HUBTEL_MERCHANT_ACCOUNT_NUMBER
         sync: false
+      - key: HUBTEL_DISBURSEMENT_ACCOUNT_NUMBER
+        sync: false
+      - key: HUBTEL_CHECKOUT_BASE_URL
+        value: https://payproxyapi.hubtel.com
+      - key: HUBTEL_TXN_STATUS_BASE_URL
+        value: https://api-txnstatus.hubtel.com
+      - key: HUBTEL_SEND_STATUS_BASE_URL
+        value: https://smrsc.hubtel.com
+      - key: HUBTEL_SEND_MONEY_URL
+        sync: false
+      - key: HUBTEL_SEND_TO_BANK_URL_TEMPLATE
+        sync: false
       - key: HUBTEL_DISBURSEMENT_BASE_URL
         sync: false
       - key: HUBTEL_CALLBACK_URL
+        sync: false
+      - key: HUBTEL_PREAUTH_CALLBACK_URL
         sync: false
       - key: HUBTEL_WEBHOOK_SECRET
         sync: false

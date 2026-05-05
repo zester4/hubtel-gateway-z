@@ -189,7 +189,7 @@ app.get("/api/meta/payout-options", async (_req, res) => {
   }
 });
 
-app.get("/api/verify-momo-account", async (req, res) => {
+app.get("/api/verify-momo-account", requireGatewayToken, async (req, res) => {
   try {
     const channel = String(req.query.channel || "").trim();
     const phone = String(req.query.phone || "").trim();
@@ -209,6 +209,7 @@ app.get("/api/verify-momo-account", async (req, res) => {
       headers: { Authorization: hubtelAuthHeader() },
     });
     const data = await response.json().catch(() => ({}));
+    console.log(`[HUBTEL RNV] ${response.status} ${channel} ${normalizeGhMsisdn(phone).slice(0, 5)}***`);
     if (!response.ok) {
       return res.status(response.status).json({ error: "Hubtel momo verification failed", details: data });
     }
@@ -224,7 +225,7 @@ app.get("/api/verify-momo-account", async (req, res) => {
   }
 });
 
-app.post("/api/verify-bank-account", async (req, res) => {
+app.post("/api/verify-bank-account", requireGatewayToken, async (req, res) => {
   try {
     const { bank_code, account_number } = req.body || {};
     if (!bank_code || !account_number) {

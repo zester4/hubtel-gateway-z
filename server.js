@@ -24,8 +24,9 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 
 function requireGatewayToken(req, res, next) {
   const token = req.header("x-gateway-token");
-  if (!process.env.HUBTEL_GATEWAY_TOKEN || token !== process.env.HUBTEL_GATEWAY_TOKEN) {
-    console.log(`[AUTH FAILED] Missing or invalid x-gateway-token. Expected: ${process.env.HUBTEL_GATEWAY_TOKEN ? 'set' : 'not set'}, Received: ${token}`);
+  const expected = process.env.HUBTEL_GATEWAY_TOKEN || process.env.GATEWAY_TOKEN;
+  if (!expected || token !== expected) {
+    console.log(`[AUTH FAILED] Missing or invalid x-gateway-token. Expected: ${expected ? 'set' : 'not set'}, Received: ${token ? 'set' : 'missing'}`);
     return res.status(401).json({ error: "Unauthorized gateway request" });
   }
   next();

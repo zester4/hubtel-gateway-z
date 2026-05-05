@@ -32,8 +32,26 @@ function requireGatewayToken(req, res, next) {
   next();
 }
 
-function hubtelAuthHeader() {
-  const raw = `${process.env.HUBTEL_CLIENT_ID}:${process.env.HUBTEL_CLIENT_SECRET}`;
+function normalizeBasicAuth(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  return raw.toLowerCase().startsWith("basic ") ? raw : `Basic ${raw}`;
+}
+
+function hubtelAuthHeader(scope = "HUBTEL") {
+  const basic = normalizeBasicAuth(process.env[`${scope}_BASIC_AUTH`]);
+  if (basic) return basic;
+  const clientId =
+    process.env[`${scope}_API_ID`] ||
+    process.env[`${scope}_CLIENT_ID`] ||
+    process.env.HUBTEL_API_ID ||
+    process.env.HUBTEL_CLIENT_ID;
+  const clientSecret =
+    process.env[`${scope}_API_KEY`] ||
+    process.env[`${scope}_CLIENT_SECRET`] ||
+    process.env.HUBTEL_API_KEY ||
+    process.env.HUBTEL_CLIENT_SECRET;
+  const raw = `${clientId}:${clientSecret}`;
   return `Basic ${Buffer.from(raw).toString("base64")}`;
 }
 
@@ -206,7 +224,7 @@ app.get("/api/verify-momo-account", requireGatewayToken, async (req, res) => {
     const url = `${base}/merchantaccount/merchants/${encodeURIComponent(process.env.HUBTEL_MERCHANT_ACCOUNT_NUMBER)}/mobilemoney/verify?channel=${encodeURIComponent(channel)}&customerMsisdn=${encodeURIComponent(phone)}`;
     const response = await fetch(url, {
       method: "GET",
-      headers: { Authorization: hubtelAuthHeader() },
+      headers: { Authorization: hubtelAuthHeader("HUBTEL_RNV") },
     });
     const data = await response.json().catch(() => ({}));
     console.log(`[HUBTEL RNV] ${response.status} ${channel} ${normalizeGhMsisdn(phone).slice(0, 5)}***`);
@@ -279,7 +297,7 @@ app.post("/api/direct-debit/preapproval/initiate", requireGatewayToken, async (r
     };
     const response = await fetch(url, {
       method: "POST",
-      headers: { Authorization: hubtelAuthHeader(), "Content-Type": "application/json" },
+      headers: { Authorization: hubtelAuthHeader("HUBTEL_DIRECT_DEBIT"), "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
     const data = await response.json().catch(() => ({}));
@@ -323,7 +341,7 @@ app.post("/api/direct-debit/preapproval/verify-otp", requireGatewayToken, async 
     const url = `${preapprovalBaseUrl()}/api/v2/merchant/${encodeURIComponent(collection)}/preapproval/verifyotp`;
     const response = await fetch(url, {
       method: "POST",
-      headers: { Authorization: hubtelAuthHeader(), "Content-Type": "application/json" },
+      headers: { Authorization: hubtelAuthHeader("HUBTEL_DIRECT_DEBIT"), "Content-Type": "application/json" },
       body: JSON.stringify({
         customerMsisdn: normalizeGhMsisdn(customer_msisdn),
         hubtelPreApprovalId: hubtel_preapproval_id,
@@ -352,7 +370,7 @@ app.get("/api/direct-debit/preapproval/status", requireGatewayToken, async (req,
     if (!reference) return res.status(400).json({ error: "reference is required" });
     const collection = requireCollectionAccount();
     const url = `${preapprovalBaseUrl()}/api/v2/merchant/${encodeURIComponent(collection)}/preapproval/${encodeURIComponent(String(reference))}/status`;
-    const response = await fetch(url, { method: "GET", headers: { Authorization: hubtelAuthHeader(), Accept: "application/json" } });
+    const response = await fetch(url, { method: "GET", headers: { Authorization: hubtelAuthHeader("HUBTEL_DIRECT_DEBIT"), Accept: "application/json" } });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) return res.status(response.status).json({ error: "Hubtel preapproval status failed", details: data });
     return res.json({ ok: true, raw: data });
@@ -386,7 +404,7 @@ app.post("/api/direct-debit/charge", requireGatewayToken, async (req, res) => {
     };
     const response = await fetch(url, {
       method: "POST",
-      headers: { Authorization: hubtelAuthHeader(), "Content-Type": "application/json" },
+      headers: { Authorization: hubtelAuthHeader("HUBTEL_DIRECT_DEBIT"), "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
     const data = await response.json().catch(() => ({}));
@@ -463,7 +481,7 @@ app.post("/api/checkout/initiate", requireGatewayToken, async (req, res) => {
     if (payee_email) body.payeeEmail = payee_email;
     const r = await fetch(checkoutInitiateUrl(), {
       method: "POST",
-      headers: { Authorization: hubtelAuthHeader(), "Content-Type": "application/json" },
+      headers: { Authorization: hubtelAuthHeader("HUBTEL_CHECKOUT"), "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
     const data = await r.json().catch(() => ({}));
@@ -587,7 +605,7 @@ async function initiateHubtelDisbursement({ reference, amount, currency = "GHS",
   const response = await fetch(url, {
     method: "POST",
     headers: {
-      Authorization: hubtelAuthHeader(),
+      Authorization: hubtelAuthHeader("HUBTEL_DISBURSEMENT"),
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
@@ -630,7 +648,7 @@ async function initiateHubtelDisbursement({ reference, amount, currency = "GHS",
     await supabase.from("notifications").insert({
       user_id: worker_user_id,
       title: "Payout processing",
-      subtitle: `Your Ghana payout is being processed via Hubtel (${currency}).`,
+      subtitle: `Your payout is being processed via Hubtel (${currency}).`,
       type: "payment_update",
       icon: "wallet",
       deep_link: "/worker/earnings",
@@ -678,7 +696,7 @@ app.get("/api/transaction-status/checkout", requireGatewayToken, async (req, res
 
     const response = await fetch(url.toString(), {
       method: "GET",
-      headers: { Authorization: hubtelAuthHeader(), Accept: "application/json" },
+      headers: { Authorization: hubtelAuthHeader("HUBTEL_CHECKOUT"), Accept: "application/json" },
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) return res.status(response.status).json({ error: "Hubtel checkout status failed", details: data });
@@ -706,7 +724,7 @@ app.get("/api/transaction-status/send-money", requireGatewayToken, async (req, r
 
     const response = await fetch(url.toString(), {
       method: "GET",
-      headers: { Authorization: hubtelAuthHeader(), Accept: "application/json" },
+      headers: { Authorization: hubtelAuthHeader("HUBTEL_DISBURSEMENT"), Accept: "application/json" },
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) return res.status(response.status).json({ error: "Hubtel send-money status failed", details: data });

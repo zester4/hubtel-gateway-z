@@ -11,11 +11,21 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Custom request logger
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl} | Status: ${res.statusCode} | Time: ${duration}ms`);
+  });
+  next();
+});
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
 function requireGatewayToken(req, res, next) {
   const token = req.header("x-gateway-token");
-  if (!process.env.GATEWAY_TOKEN || token !== process.env.GATEWAY_TOKEN) {
+  if (!process.env.HUBTEL_GATEWAY_TOKEN || token !== process.env.HUBTEL_GATEWAY_TOKEN) {
+    console.log(`[AUTH FAILED] Missing or invalid x-gateway-token. Expected: ${process.env.HUBTEL_GATEWAY_TOKEN ? 'set' : 'not set'}, Received: ${token}`);
     return res.status(401).json({ error: "Unauthorized gateway request" });
   }
   next();

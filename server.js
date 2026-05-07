@@ -983,8 +983,9 @@ app.get("/api/checkout/setup-status", requireGatewayToken, async (req, res) => {
   try {
     const venueUserId = String(req.query.venue_user_id || req.query.venueUserId || "").trim();
     const reference = String(req.query.reference || "").trim();
-    if (!venueUserId && !reference) {
-      return res.status(400).json({ error: "venue_user_id or reference is required" });
+    const checkoutId = String(req.query.checkout_id || req.query.checkoutid || "").trim();
+    if (!venueUserId && !reference && !checkoutId) {
+      return res.status(400).json({ error: "venue_user_id, reference, or checkout_id is required" });
     }
 
     let query = supabase
@@ -995,6 +996,10 @@ app.get("/api/checkout/setup-status", requireGatewayToken, async (req, res) => {
       .limit(1);
     if (reference) {
       query = query.eq("collection_reference", reference);
+      if (venueUserId) query = query.eq("venue_user_id", venueUserId);
+    } else if (checkoutId) {
+      query = query.eq("collection_external_id", checkoutId);
+      if (venueUserId) query = query.eq("venue_user_id", venueUserId);
     } else {
       query = query.eq("venue_user_id", venueUserId);
     }

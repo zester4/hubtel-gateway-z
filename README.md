@@ -34,12 +34,16 @@ Each product supports either `*_API_ID` + `*_API_KEY` or `*_BASIC_AUTH`.
 
 - `GET /health`
 - `POST /api/disburse` (called by Supabase function)
+- `POST /api/checkout/initiate` (Hubtel Checkout; dedupes shift checkouts for 30 minutes)
+- `POST /api/checkout/refund` (Hubtel Checkout refund; requires `checkout_id` or `reference`; cash/cheque reversal uses `HUBTEL_POS_REVERSAL_URL`)
 - `GET /api/meta/payout-options` (momo channels + banks list)
 - `GET /api/verify-momo-account?channel=mtn-gh&phone=233...` (MoMo account name check; requires `x-gateway-token`)
 - `POST /api/verify-bank-account` (account-name verification; requires `x-gateway-token`)
 - `POST /webhooks/hubtel` (Hubtel status callback)
+- `POST /webhooks/hubtel/refund` (Hubtel refund callback; forwards signed status to `hubtel-refund-webhook`)
 
 ## Security
 
 - `x-gateway-token` required for internal disbursement calls.
-- Optional webhook HMAC verification with `HUBTEL_WEBHOOK_SECRET`.
+- Gateway-to-Supabase refund callbacks require `HUBTEL_WEBHOOK_SECRET` and include `x-signature`, an HMAC-SHA256 of the JSON body.
+- Hubtel callback HMAC verification remains supported with `x-hubtel-signature` when Hubtel is configured to send it.

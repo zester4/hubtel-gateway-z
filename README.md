@@ -1,11 +1,14 @@
-# ZiloShift Hubtel Gateway (Render/Railway)
+# ZiloShift Hubtel Gateway (ORACLE CLOUD)
 
 Use this service for Ghana-only Hubtel payout calls from a static-whitelisted `/32` server IP.
+
+COMMANDS: pm2 restart hubtel-gateway --update-env
+~/deploy.sh
 
 ## Why this exists
 
 - Supabase Edge Functions do not provide a fixed outbound IP for Hubtel whitelist requirements.
-- Render/Railway service with static egress IP can be whitelisted by Hubtel.
+- ORACLE CLOUD service with static egress IP can be whitelisted by Hubtel.
 
 ## Deploy
 

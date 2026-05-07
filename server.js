@@ -436,26 +436,36 @@ app.post("/api/verify-bank-account", requireGatewayToken, async (req, res) => {
     if (!bank_code || !account_number) {
       return res.status(400).json({ error: "bank_code and account_number are required" });
     }
-    if (!process.env.HUBTEL_BANK_VERIFY_URL) {
-      return res.json({
-        ok: true,
-        verified: false,
-        message: "Bank verification URL not configured. Set HUBTEL_BANK_VERIFY_URL.",
-      });
+    if (!GH_BANKS.some((bank) => bank.code === String(bank_code))) {
+      return res.status(400).json({ error: "Unsupported Ghana bank code" });
     }
-    const vr = await fetchHubtelJson(process.env.HUBTEL_BANK_VERIFY_URL, { bank_code, account_number });
-    if (!vr.ok) return res.status(vr.status).json({ error: "Bank verification failed", details: vr.data });
+    const collection = requireCollectionAccount();
+    const base = (process.env.HUBTEL_RNV_BASE_URL || "https://rnv.hubtel.com").replace(/\/$/, "");
+    const url = `${base}/v2/merchantaccount/merchants/${encodeURIComponent(collection)}/bank/verify/${encodeURIComponent(bank_code)}/${encodeURIComponent(account_number)}`;
+    const response = await fetch(url, {
+      method: "GET",
+      headers: { Authorization: hubtelAuthHeader("HUBTEL_RNV"), Accept: "application/json" },
+    });
+    const data = await response.json().catch(() => ({}));
+    logHubtelFailure("RNV_BANK", response, data);
+    if (!response.ok && response.status !== 400 && response.status !== 424) {
+      return res.status(response.status).json({ error: "Bank verification failed", details: data });
+    }
     const accountName =
-      vr.data?.Data?.AccountName ||
-      vr.data?.data?.account_name ||
-      vr.data?.account_name ||
-      vr.data?.accountName ||
+      data?.data?.name ||
+      data?.Data?.Name ||
+      data?.Data?.AccountName ||
+      data?.account_name ||
+      data?.accountName ||
       null;
+    const responseCode = String(data?.responseCode ?? data?.ResponseCode ?? "");
     return res.json({
       ok: true,
-      verified: Boolean(accountName),
+      verified: responseCode === "0000" && Boolean(accountName),
       account_name: accountName,
-      raw: vr.data,
+      message: data?.message || data?.Message || null,
+      response_code: responseCode,
+      raw: data,
     });
   } catch (error) {
     return res.status(500).json({ error: error.message });

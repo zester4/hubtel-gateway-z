@@ -1014,8 +1014,24 @@ app.get("/api/checkout/setup-status", requireGatewayToken, async (req, res) => {
       query = query.eq("venue_user_id", venueUserId);
     }
 
-    const { data: rows, error } = await query;
+    let { data: rows, error } = await query;
     if (error) return res.status(500).json({ error: error.message });
+
+    // Hubtel returns only checkoutid on the browser return URL. If an older row
+    // missed collection_external_id for any reason, fall back to the venue's most
+    // recent setup checkout and reconcile by clientReference.
+    if (!rows?.[0] && checkoutId && venueUserId) {
+      const fallback = await supabase
+        .from("payments")
+        .select("id,venue_user_id,collection_provider,collection_reference,collection_external_id,collection_checkout_url,collection_checkout_direct_url,created_at,status")
+        .eq("collection_provider", "hubtel_checkout_setup")
+        .eq("venue_user_id", venueUserId)
+        .order("created_at", { ascending: false })
+        .limit(1);
+      if (fallback.error) return res.status(500).json({ error: fallback.error.message });
+      rows = fallback.data || [];
+    }
+
     const payment = rows?.[0];
     if (!payment) {
       return res.json({ ok: true, connected: false, status: "not_found" });
@@ -1028,6 +1044,8 @@ app.get("/api/checkout/setup-status", requireGatewayToken, async (req, res) => {
         status: "captured",
         checkout_id: payment.collection_external_id,
         reference: payment.collection_reference,
+        checkout_url: payment.collection_checkout_url || null,
+        checkout_direct_url: payment.collection_checkout_direct_url || null,
       });
     }
 
@@ -1038,6 +1056,8 @@ app.get("/api/checkout/setup-status", requireGatewayToken, async (req, res) => {
       status: reconciled.status,
       checkout_id: payment.collection_external_id,
       reference: payment.collection_reference,
+      checkout_url: payment.collection_checkout_url || null,
+      checkout_direct_url: payment.collection_checkout_direct_url || null,
       payment_method: reconciled.payment_method || null,
       payment_channel: reconciled.payment_channel || null,
       raw: reconciled.raw,

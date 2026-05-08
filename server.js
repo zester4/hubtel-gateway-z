@@ -264,6 +264,16 @@ const GH_BANKS = [
   { code: "300362", name: "GHL Bank" },
 ];
 
+const CHECKOUT_PAYMENT_SELECT = [
+  "id",
+  "venue_user_id",
+  "collection_provider",
+  "collection_reference",
+  "collection_external_id",
+  "created_at",
+  "status",
+].join(",");
+
 async function fetchHubtelJson(url, body, method = "POST") {
   const response = await fetch(url, {
     method,
@@ -675,7 +685,7 @@ app.post("/api/checkout/initiate", requireGatewayToken, async (req, res) => {
     if (purpose === "venue_billing_setup" && venue_user_id) {
       ({ data: existingRows, error: existingError } = await supabase
         .from("payments")
-        .select("id,venue_user_id,collection_provider,collection_reference,collection_external_id,collection_checkout_url,collection_checkout_direct_url,created_at,status")
+        .select(CHECKOUT_PAYMENT_SELECT)
         .eq("venue_user_id", venue_user_id)
         .eq("collection_provider", collectionProvider)
         .gte("created_at", dedupeSince)
@@ -684,7 +694,7 @@ app.post("/api/checkout/initiate", requireGatewayToken, async (req, res) => {
     } else if (shift_id) {
       let existingQuery = supabase
         .from("payments")
-        .select("id,venue_user_id,collection_provider,collection_reference,collection_external_id,collection_checkout_url,collection_checkout_direct_url,created_at,status")
+        .select(CHECKOUT_PAYMENT_SELECT)
         .eq("shift_id", shift_id)
         .eq("collection_provider", collectionProvider)
         .gte("created_at", dedupeSince)
@@ -1000,7 +1010,7 @@ app.get("/api/checkout/setup-status", requireGatewayToken, async (req, res) => {
 
     let query = supabase
       .from("payments")
-      .select("id,venue_user_id,collection_provider,collection_reference,collection_external_id,collection_checkout_url,collection_checkout_direct_url,created_at,status")
+      .select(CHECKOUT_PAYMENT_SELECT)
       .eq("collection_provider", "hubtel_checkout_setup")
       .order("created_at", { ascending: false })
       .limit(1);
@@ -1023,7 +1033,7 @@ app.get("/api/checkout/setup-status", requireGatewayToken, async (req, res) => {
     if (!rows?.[0] && checkoutId && venueUserId) {
       const fallback = await supabase
         .from("payments")
-        .select("id,venue_user_id,collection_provider,collection_reference,collection_external_id,collection_checkout_url,collection_checkout_direct_url,created_at,status")
+        .select(CHECKOUT_PAYMENT_SELECT)
         .eq("collection_provider", "hubtel_checkout_setup")
         .eq("venue_user_id", venueUserId)
         .order("created_at", { ascending: false })

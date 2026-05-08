@@ -192,33 +192,45 @@ function mapHubtelCollectionStatus(payload) {
 function mapHubtelCheckoutTransactionStatus(payload) {
   const rc = String(payload?.ResponseCode ?? payload?.responseCode ?? "").trim().toLowerCase();
   const data = payload?.data ?? payload?.Data ?? {};
-  
-  // Try to find status in common locations
-  const status = String(
-    data?.status ?? 
-    data?.Status ?? 
-    data?.transactionStatus ?? 
-    data?.TransactionStatus ?? 
-    payload?.status ?? 
-    payload?.Status ?? 
-    payload?.TransactionStatus ?? 
+  const status = String(data?.status ?? data?.Status ?? "").trim().toLowerCase();
+  const transactionStatus = String(
+    data?.transactionStatus ??
+    data?.TransactionStatus ??
+    payload?.transactionStatus ??
+    payload?.TransactionStatus ??
     ""
-  ).toLowerCase();
+  ).trim().toLowerCase();
+  const topStatus = String(payload?.status ?? payload?.Status ?? "").trim().toLowerCase();
 
-  const successValues = ["paid", "captured", "success", "successful"];
-  // Inclusion of "0000" and "success" as top-level RC indicators
-  const isSuccess = rc === "0000" || rc === "success" || successValues.includes(status) || status.includes("success");
-  
-  if (isSuccess) return "captured";
-  
+  if (status === "paid" || status === "captured") return "captured";
+  if (status === "unpaid") return "processing";
+  if (status === "refunded") return "refunded";
+  if (status === "failed" || status === "expired") return "failed";
+
+  if (["success", "successful", "paid", "captured"].includes(transactionStatus) || transactionStatus.includes("success")) {
+    return "captured";
+  }
+  if (["failed", "expired"].includes(transactionStatus) || transactionStatus.includes("fail")) return "failed";
+
+  // Callback-style payloads use ResponseCode/Status=Success, while status-check
+  // payloads use responseCode=0000 for both Paid and Unpaid. Only trust 0000
+  // alone when there is no explicit transaction status to contradict it.
+  if ((rc === "success" || rc === "0000") && ["success", "successful"].includes(topStatus)) return "captured";
+
   const pendingValues = ["unpaid", "pending", "processing"];
-  if (rc === "0001" || pendingValues.includes(status) || status.includes("pending") || status.includes("processing")) {
+  if (
+    rc === "0001" ||
+    pendingValues.includes(transactionStatus) ||
+    pendingValues.includes(topStatus) ||
+    transactionStatus.includes("pending") ||
+    transactionStatus.includes("processing") ||
+    topStatus.includes("pending") ||
+    topStatus.includes("processing")
+  ) {
     return "processing";
   }
-  
-  if (status === "refunded") return "refunded";
-  
-  if (status === "failed" || status === "expired" || (rc && rc !== "0000" && rc !== "0001" && rc !== "success")) {
+
+  if (rc && rc !== "0000" && rc !== "0001" && rc !== "success") {
     return "failed";
   }
 
@@ -390,8 +402,19 @@ async function reconcileCheckoutPayment(payment) {
   }
 
   const statusData = result.data?.data ?? result.data?.Data ?? {};
-  const paymentMethod = statusData?.paymentMethod ?? statusData?.PaymentMethod ?? null;
-  const channel = statusData?.channel ?? statusData?.Channel ?? null;
+  const paymentDetails = statusData?.PaymentDetails ?? statusData?.paymentDetails ?? {};
+  const paymentMethod =
+    statusData?.paymentMethod ??
+    statusData?.PaymentMethod ??
+    paymentDetails?.PaymentType ??
+    paymentDetails?.paymentType ??
+    null;
+  const channel =
+    statusData?.channel ??
+    statusData?.Channel ??
+    paymentDetails?.Channel ??
+    paymentDetails?.channel ??
+    null;
   
   console.log(`[CHECKOUT RECONCILE] Final status for ${payment.id}: ${status}`);
 

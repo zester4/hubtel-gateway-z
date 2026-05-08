@@ -359,6 +359,7 @@ async function updatePaymentWithOptionalFields(matcher, patch) {
     delete fallbackPatch.collection_checkout_direct_url;
     delete fallbackPatch.collection_payment_method;
     delete fallbackPatch.collection_payment_channel;
+    delete fallbackPatch.worker_amount;
     const { error: fallbackError } = await supabase.from("payments").update(fallbackPatch).match(matcher);
     if (fallbackError) throw fallbackError;
   } else if (error) {
@@ -509,7 +510,7 @@ async function reconcileCheckoutWithoutPayment({ venueUserId, checkoutId }) {
 
   const { error } = await supabase.from("payments").insert(recoveredPayment);
   if (error?.code === "42703") {
-    const { collection_payment_method, collection_payment_channel, ...fallbackPayment } = recoveredPayment;
+    const { collection_payment_method, collection_payment_channel, worker_amount, ...fallbackPayment } = recoveredPayment;
     const { error: fallbackError } = await supabase.from("payments").insert(fallbackPayment);
     if (fallbackError) console.error("[CHECKOUT RECOVER] Failed to insert recovered payment:", fallbackError);
   } else if (error) {
@@ -1001,7 +1002,7 @@ app.post("/api/checkout/initiate", requireGatewayToken, async (req, res) => {
     } else {
       const { error } = await supabase.from("payments").insert(paymentPatch);
       if (error?.code === "42703") {
-        const { collection_checkout_url, collection_checkout_direct_url, ...fallbackPatch } = paymentPatch;
+        const { collection_checkout_url, collection_checkout_direct_url, worker_amount, ...fallbackPatch } = paymentPatch;
         const { error: fallbackError } = await supabase.from("payments").insert(fallbackPatch);
         if (fallbackError) throw fallbackError;
       } else if (error) {

@@ -190,7 +190,7 @@ function mapHubtelCollectionStatus(payload) {
 }
 
 function mapHubtelCheckoutTransactionStatus(payload) {
-  const rc = String(payload?.ResponseCode ?? payload?.responseCode ?? "").trim();
+  const rc = String(payload?.ResponseCode ?? payload?.responseCode ?? "").trim().toLowerCase();
   const data = payload?.data ?? payload?.Data ?? {};
   
   // Try to find status in common locations
@@ -206,7 +206,8 @@ function mapHubtelCheckoutTransactionStatus(payload) {
   ).toLowerCase();
 
   const successValues = ["paid", "captured", "success", "successful"];
-  const isSuccess = rc === "0000" || successValues.includes(status) || status.includes("success");
+  // Inclusion of "0000" and "success" as top-level RC indicators
+  const isSuccess = rc === "0000" || rc === "success" || successValues.includes(status) || status.includes("success");
   
   if (isSuccess) return "captured";
   
@@ -217,7 +218,7 @@ function mapHubtelCheckoutTransactionStatus(payload) {
   
   if (status === "refunded") return "refunded";
   
-  if (status === "failed" || status === "expired" || (rc && rc !== "0000" && rc !== "0001")) {
+  if (status === "failed" || status === "expired" || (rc && rc !== "0000" && rc !== "0001" && rc !== "success")) {
     return "failed";
   }
 
@@ -353,13 +354,19 @@ async function reconcileCheckoutPayment(payment) {
     if (ref) url.searchParams.set("clientReference", String(ref));
     else if (id) url.searchParams.set("hubtelTransactionId", String(id));
     
-    console.log(`[HUBTEL CHECK STATUS] Calling: ${url.toString().replace(collection, "HIDDEN")}`);
+    console.log(`[HUBTEL STATUS CHECK] URL: ${url.toString().replace(collection, "HIDDEN")}`);
     
     const response = await fetch(url.toString(), {
       method: "GET",
       headers: { Authorization: hubtelAuthHeader("HUBTEL_CHECKOUT"), Accept: "application/json" },
     });
     const data = await response.json().catch(() => ({}));
+    
+    // Log structure to help identify why mapping might fail
+    const rc = data.ResponseCode || data.responseCode;
+    const dk = data.Data ? Object.keys(data.Data).join(",") : data.data ? Object.keys(data.data).join(",") : "N/A";
+    console.log(`[HUBTEL STATUS CHECK] ResponseCode: ${rc} | Keys: ${Object.keys(data).join(", ")} | DataKeys: ${dk}`);
+    
     return { ok: response.ok, status: response.status, data };
   };
 
@@ -368,7 +375,7 @@ async function reconcileCheckoutPayment(payment) {
 
   // If not captured and we have an externalId, try that as well
   if (status !== "captured" && externalId && externalId !== clientReference) {
-    console.log(`[CHECKOUT RECONCILE] Fallback to externalId: ${externalId}`);
+    console.log(`[CHECKOUT RECONCILE] Primary fail (Status: ${status}). Trying fallback ExternalID: ${externalId}`);
     const fallbackResult = await checkStatus(null, externalId);
     const fallbackStatus = mapHubtelCheckoutTransactionStatus(fallbackResult.data);
     if (fallbackStatus === "captured") {
@@ -386,10 +393,7 @@ async function reconcileCheckoutPayment(payment) {
   const paymentMethod = statusData?.paymentMethod ?? statusData?.PaymentMethod ?? null;
   const channel = statusData?.channel ?? statusData?.Channel ?? null;
   
-  console.log(`[CHECKOUT RECONCILE] Final result for ${payment.id}: Status=${status} | Method=${paymentMethod} | Channel=${channel}`);
-  if (status !== "captured") {
-    console.log(`[CHECKOUT RECONCILE] Non-captured payload: ${JSON.stringify(redactHubtelDetails(result.data))}`);
-  }
+  console.log(`[CHECKOUT RECONCILE] Final status for ${payment.id}: ${status}`);
 
   await updatePaymentWithOptionalFields(
     { id: payment.id },

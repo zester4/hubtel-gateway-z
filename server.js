@@ -192,20 +192,34 @@ function mapHubtelCollectionStatus(payload) {
 function mapHubtelCheckoutTransactionStatus(payload) {
   const rc = String(payload?.ResponseCode ?? payload?.responseCode ?? "").trim();
   const data = payload?.data ?? payload?.Data ?? {};
-  const status = String(data?.status ?? data?.Status ?? "").toLowerCase();
-
-  // If rc is 0000, it's a definite success.
-  // If status is "paid", "captured", or contains "success", it's a success.
-  if (rc === "0000" || status === "paid" || status === "captured" || status.includes("success")) return "captured";
   
-  // If rc is 0001 or status is "unpaid" or "pending", it's still processing.
-  if (rc === "0001" || status === "unpaid" || status === "pending" || status.includes("pending") || status === "processing") return "processing";
+  // Try to find status in common locations
+  const status = String(
+    data?.status ?? 
+    data?.Status ?? 
+    data?.transactionStatus ?? 
+    data?.TransactionStatus ?? 
+    payload?.status ?? 
+    payload?.Status ?? 
+    payload?.TransactionStatus ?? 
+    ""
+  ).toLowerCase();
+
+  const successValues = ["paid", "captured", "success", "successful"];
+  const isSuccess = rc === "0000" || successValues.includes(status) || status.includes("success");
+  
+  if (isSuccess) return "captured";
+  
+  const pendingValues = ["unpaid", "pending", "processing"];
+  if (rc === "0001" || pendingValues.includes(status) || status.includes("pending") || status.includes("processing")) {
+    return "processing";
+  }
   
   if (status === "refunded") return "refunded";
   
-  // If we have an error code that isn't success or pending, it's a failure.
-  if (rc && rc !== "0000" && rc !== "0001") return "failed";
-  if (status === "failed" || status === "expired") return "failed";
+  if (status === "failed" || status === "expired" || (rc && rc !== "0000" && rc !== "0001")) {
+    return "failed";
+  }
 
   return "processing";
 }
@@ -314,10 +328,13 @@ async function updatePaymentWithOptionalFields(matcher, patch) {
 async function markVenueBillingConnected(venueUserId) {
   if (!venueUserId) return;
   console.log(`[VENUE BILLING] Marking venue ${venueUserId} as connected.`);
-  await supabase.from("venues").update({
+  const { error } = await supabase.from("venues").update({
     stripe_onboarding_complete: true,
     hubtel_billing_type: "online_checkout",
   }).eq("user_id", venueUserId);
+  if (error) {
+    console.error(`[VENUE BILLING ERROR] Failed to update venue ${venueUserId}:`, error);
+  }
 }
 
 async function reconcileCheckoutPayment(payment) {
@@ -336,6 +353,8 @@ async function reconcileCheckoutPayment(payment) {
     if (ref) url.searchParams.set("clientReference", String(ref));
     else if (id) url.searchParams.set("hubtelTransactionId", String(id));
     
+    console.log(`[HUBTEL CHECK STATUS] Calling: ${url.toString().replace(collection, "HIDDEN")}`);
+    
     const response = await fetch(url.toString(), {
       method: "GET",
       headers: { Authorization: hubtelAuthHeader("HUBTEL_CHECKOUT"), Accept: "application/json" },
@@ -348,7 +367,8 @@ async function reconcileCheckoutPayment(payment) {
   let status = mapHubtelCheckoutTransactionStatus(result.data);
 
   // If not captured and we have an externalId, try that as well
-  if (status !== "captured" && externalId) {
+  if (status !== "captured" && externalId && externalId !== clientReference) {
+    console.log(`[CHECKOUT RECONCILE] Fallback to externalId: ${externalId}`);
     const fallbackResult = await checkStatus(null, externalId);
     const fallbackStatus = mapHubtelCheckoutTransactionStatus(fallbackResult.data);
     if (fallbackStatus === "captured") {
@@ -366,9 +386,9 @@ async function reconcileCheckoutPayment(payment) {
   const paymentMethod = statusData?.paymentMethod ?? statusData?.PaymentMethod ?? null;
   const channel = statusData?.channel ?? statusData?.Channel ?? null;
   
-  console.log(`[CHECKOUT RECONCILE] Payment: ${payment.id} | Status: ${status} | Method: ${paymentMethod} | Channel: ${channel}`);
+  console.log(`[CHECKOUT RECONCILE] Final result for ${payment.id}: Status=${status} | Method=${paymentMethod} | Channel=${channel}`);
   if (status !== "captured") {
-    console.log(`[CHECKOUT RECONCILE] Raw response for non-captured: ${JSON.stringify(redactHubtelDetails(result.data))}`);
+    console.log(`[CHECKOUT RECONCILE] Non-captured payload: ${JSON.stringify(redactHubtelDetails(result.data))}`);
   }
 
   await updatePaymentWithOptionalFields(

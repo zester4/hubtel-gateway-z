@@ -22,6 +22,27 @@ app.use((req, res, next) => {
 });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
+function assertSupabaseAdminConfigured() {
+  const key = String(process.env.SUPABASE_SERVICE_ROLE_KEY || "");
+  if (!process.env.SUPABASE_URL || !key) {
+    throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required");
+  }
+  if (key.startsWith("sb_publishable_") || key.startsWith("sb_anon_")) {
+    throw new Error("SUPABASE_SERVICE_ROLE_KEY must be a secret/service-role key, not a publishable/anon key");
+  }
+  const parts = key.split(".");
+  if (parts.length >= 2) {
+    try {
+      const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+      if (payload?.role && payload.role !== "service_role") {
+        throw new Error(`SUPABASE_SERVICE_ROLE_KEY must have role service_role, not ${payload.role}`);
+      }
+    } catch (error) {
+      if (error.message.includes("SUPABASE_SERVICE_ROLE_KEY")) throw error;
+    }
+  }
+}
+
 function requireGatewayToken(req, res, next) {
   const token = req.header("x-gateway-token");
   const expected = process.env.HUBTEL_GATEWAY_TOKEN || process.env.GATEWAY_TOKEN;
@@ -309,6 +330,10 @@ const CHECKOUT_PAYMENT_SELECT = [
   "collection_provider",
   "collection_reference",
   "collection_external_id",
+  "collection_checkout_url",
+  "collection_checkout_direct_url",
+  "collection_payment_method",
+  "collection_payment_channel",
   "created_at",
   "status",
 ].join(",");
@@ -334,7 +359,10 @@ async function updatePaymentWithOptionalFields(matcher, patch) {
     delete fallbackPatch.collection_checkout_direct_url;
     delete fallbackPatch.collection_payment_method;
     delete fallbackPatch.collection_payment_channel;
-    await supabase.from("payments").update(fallbackPatch).match(matcher);
+    const { error: fallbackError } = await supabase.from("payments").update(fallbackPatch).match(matcher);
+    if (fallbackError) throw fallbackError;
+  } else if (error) {
+    throw error;
   }
 }
 
@@ -432,6 +460,72 @@ async function reconcileCheckoutPayment(payment) {
   }
 
   return { ok: true, status, raw: result.data, payment_method: paymentMethod, payment_channel: channel };
+}
+
+async function reconcileCheckoutWithoutPayment({ venueUserId, checkoutId }) {
+  if (!checkoutId) return null;
+
+  const collection = requireCollectionAccount();
+  const base = (process.env.HUBTEL_TXN_STATUS_BASE_URL || "https://api-txnstatus.hubtel.com").replace(/\/$/, "");
+  const url = new URL(`${base}/transactions/${encodeURIComponent(collection)}/status`);
+  url.searchParams.set("hubtelTransactionId", String(checkoutId));
+
+  console.log(`[CHECKOUT RECOVER] No payment row found; checking Hubtel by checkout id ${checkoutId}`);
+  const response = await fetch(url.toString(), {
+    method: "GET",
+    headers: { Authorization: hubtelAuthHeader("HUBTEL_CHECKOUT"), Accept: "application/json" },
+  });
+  const data = await response.json().catch(() => ({}));
+  logHubtelFailure("CHECKOUT_STATUS_RECOVER", response, data);
+  if (!response.ok) return null;
+
+  const status = mapHubtelCheckoutTransactionStatus(data);
+  const statusData = data?.data ?? data?.Data ?? {};
+  if (status !== "captured") {
+    return { ok: true, connected: false, status, raw: data };
+  }
+
+  if (venueUserId) {
+    await markVenueBillingConnected(venueUserId);
+  }
+
+  const recoveredPayment = {
+    venue_user_id: venueUserId || null,
+    collection_provider: "hubtel_checkout_setup",
+    collection_reference: statusData?.clientReference ?? statusData?.ClientReference ?? null,
+    collection_external_id: String(checkoutId),
+    payout_provider: "hubtel_checkout_setup",
+    payout_reference: statusData?.clientReference ?? statusData?.ClientReference ?? null,
+    amount: Number(statusData?.amount ?? statusData?.Amount ?? 1),
+    platform_fee: 0,
+    worker_amount: 0,
+    worker_payout: 0,
+    currency: statusData?.currencyCode ?? statusData?.CurrencyCode ?? "GHS",
+    status: "captured",
+  };
+  const paymentDetails = statusData?.PaymentDetails ?? statusData?.paymentDetails ?? {};
+  recoveredPayment.collection_payment_method = statusData?.paymentMethod ?? statusData?.PaymentMethod ?? paymentDetails?.PaymentType ?? paymentDetails?.paymentType ?? null;
+  recoveredPayment.collection_payment_channel = statusData?.channel ?? statusData?.Channel ?? paymentDetails?.Channel ?? paymentDetails?.channel ?? null;
+
+  const { error } = await supabase.from("payments").insert(recoveredPayment);
+  if (error?.code === "42703") {
+    const { collection_payment_method, collection_payment_channel, ...fallbackPayment } = recoveredPayment;
+    const { error: fallbackError } = await supabase.from("payments").insert(fallbackPayment);
+    if (fallbackError) console.error("[CHECKOUT RECOVER] Failed to insert recovered payment:", fallbackError);
+  } else if (error) {
+    console.error("[CHECKOUT RECOVER] Failed to insert recovered payment:", error);
+  }
+
+  return {
+    ok: true,
+    connected: true,
+    status: "captured",
+    reference: recoveredPayment.collection_reference,
+    checkout_id: recoveredPayment.collection_external_id,
+    payment_method: recoveredPayment.collection_payment_method || null,
+    payment_channel: recoveredPayment.collection_payment_channel || null,
+    raw: data,
+  };
 }
 
 app.get("/health", (_req, res) => res.json({ ok: true, service: "ziloshift-hubtel-gateway" }));
@@ -737,6 +831,7 @@ app.post("/api/direct-debit/charge", requireGatewayToken, async (req, res) => {
 
 app.post("/api/checkout/initiate", requireGatewayToken, async (req, res) => {
   try {
+    assertSupabaseAdminConfigured();
     const {
       reference,
       amount = "1.00",
@@ -907,7 +1002,10 @@ app.post("/api/checkout/initiate", requireGatewayToken, async (req, res) => {
       const { error } = await supabase.from("payments").insert(paymentPatch);
       if (error?.code === "42703") {
         const { collection_checkout_url, collection_checkout_direct_url, ...fallbackPatch } = paymentPatch;
-        await supabase.from("payments").insert(fallbackPatch);
+        const { error: fallbackError } = await supabase.from("payments").insert(fallbackPatch);
+        if (fallbackError) throw fallbackError;
+      } else if (error) {
+        throw error;
       }
     }
 
@@ -1091,6 +1189,7 @@ app.get("/api/transaction-status/checkout", requireGatewayToken, async (req, res
 
 app.get("/api/checkout/setup-status", requireGatewayToken, async (req, res) => {
   try {
+    assertSupabaseAdminConfigured();
     const venueUserId = String(req.query.venue_user_id || req.query.venueUserId || "").trim();
     const reference = String(req.query.reference || "").trim();
     const checkoutId = String(req.query.checkout_id || req.query.checkoutid || "").trim();
@@ -1134,6 +1233,8 @@ app.get("/api/checkout/setup-status", requireGatewayToken, async (req, res) => {
 
     const payment = rows?.[0];
     if (!payment) {
+      const recovered = await reconcileCheckoutWithoutPayment({ venueUserId, checkoutId });
+      if (recovered) return res.json(recovered);
       return res.json({ ok: true, connected: false, status: "not_found" });
     }
     if (payment.status === "captured") {

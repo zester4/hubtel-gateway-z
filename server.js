@@ -190,11 +190,23 @@ function mapHubtelCollectionStatus(payload) {
 }
 
 function mapHubtelCheckoutTransactionStatus(payload) {
+  const rc = String(payload?.ResponseCode ?? payload?.responseCode ?? "").trim();
   const data = payload?.data ?? payload?.Data ?? {};
   const status = String(data?.status ?? data?.Status ?? "").toLowerCase();
-  if (status === "paid") return "captured";
+
+  // If rc is 0000, it's a definite success.
+  // If status is "paid", "captured", or contains "success", it's a success.
+  if (rc === "0000" || status === "paid" || status === "captured" || status.includes("success")) return "captured";
+  
+  // If rc is 0001 or status is "unpaid" or "pending", it's still processing.
+  if (rc === "0001" || status === "unpaid" || status === "pending" || status.includes("pending") || status === "processing") return "processing";
+  
   if (status === "refunded") return "refunded";
-  if (status === "unpaid") return "pending";
+  
+  // If we have an error code that isn't success or pending, it's a failure.
+  if (rc && rc !== "0000" && rc !== "0001") return "failed";
+  if (status === "failed" || status === "expired") return "failed";
+
   return "processing";
 }
 
@@ -301,6 +313,7 @@ async function updatePaymentWithOptionalFields(matcher, patch) {
 
 async function markVenueBillingConnected(venueUserId) {
   if (!venueUserId) return;
+  console.log(`[VENUE BILLING] Marking venue ${venueUserId} as connected.`);
   await supabase.from("venues").update({
     stripe_onboarding_complete: true,
     hubtel_billing_type: "online_checkout",
@@ -310,26 +323,54 @@ async function markVenueBillingConnected(venueUserId) {
 async function reconcileCheckoutPayment(payment) {
   const collection = requireCollectionAccount();
   const clientReference = payment?.collection_reference;
-  if (!clientReference) {
+  const externalId = payment?.collection_external_id;
+  
+  if (!clientReference && !externalId) {
     return { ok: false, status: payment?.status || "pending", raw: null };
   }
+
   const base = (process.env.HUBTEL_TXN_STATUS_BASE_URL || "https://api-txnstatus.hubtel.com").replace(/\/$/, "");
-  const url = new URL(`${base}/transactions/${encodeURIComponent(collection)}/status`);
-  url.searchParams.set("clientReference", String(clientReference));
-  const response = await fetch(url.toString(), {
-    method: "GET",
-    headers: { Authorization: hubtelAuthHeader("HUBTEL_CHECKOUT"), Accept: "application/json" },
-  });
-  const data = await response.json().catch(() => ({}));
-  logHubtelFailure("CHECKOUT_STATUS_RECONCILE", response, data);
-  if (!response.ok) {
-    return { ok: false, status: payment?.status || "pending", raw: data };
+  
+  const checkStatus = async (ref, id) => {
+    const url = new URL(`${base}/transactions/${encodeURIComponent(collection)}/status`);
+    if (ref) url.searchParams.set("clientReference", String(ref));
+    else if (id) url.searchParams.set("hubtelTransactionId", String(id));
+    
+    const response = await fetch(url.toString(), {
+      method: "GET",
+      headers: { Authorization: hubtelAuthHeader("HUBTEL_CHECKOUT"), Accept: "application/json" },
+    });
+    const data = await response.json().catch(() => ({}));
+    return { ok: response.ok, status: response.status, data };
+  };
+
+  let result = await checkStatus(clientReference, null);
+  let status = mapHubtelCheckoutTransactionStatus(result.data);
+
+  // If not captured and we have an externalId, try that as well
+  if (status !== "captured" && externalId) {
+    const fallbackResult = await checkStatus(null, externalId);
+    const fallbackStatus = mapHubtelCheckoutTransactionStatus(fallbackResult.data);
+    if (fallbackStatus === "captured") {
+      result = fallbackResult;
+      status = fallbackStatus;
+    }
   }
 
-  const status = mapHubtelCheckoutTransactionStatus(data);
-  const statusData = data?.data ?? data?.Data ?? {};
+  if (!result.ok && status !== "captured") {
+    logHubtelFailure("CHECKOUT_STATUS_RECONCILE", { ok: result.ok, status: result.status }, result.data);
+    return { ok: false, status: payment?.status || "pending", raw: result.data };
+  }
+
+  const statusData = result.data?.data ?? result.data?.Data ?? {};
   const paymentMethod = statusData?.paymentMethod ?? statusData?.PaymentMethod ?? null;
   const channel = statusData?.channel ?? statusData?.Channel ?? null;
+  
+  console.log(`[CHECKOUT RECONCILE] Payment: ${payment.id} | Status: ${status} | Method: ${paymentMethod} | Channel: ${channel}`);
+  if (status !== "captured") {
+    console.log(`[CHECKOUT RECONCILE] Raw response for non-captured: ${JSON.stringify(redactHubtelDetails(result.data))}`);
+  }
+
   await updatePaymentWithOptionalFields(
     { id: payment.id },
     {
@@ -338,10 +379,12 @@ async function reconcileCheckoutPayment(payment) {
       collection_payment_channel: channel,
     }
   );
+
   if (status === "captured" && payment.collection_provider === "hubtel_checkout_setup" && payment.venue_user_id) {
     await markVenueBillingConnected(payment.venue_user_id);
   }
-  return { ok: true, status, raw: data, payment_method: paymentMethod, payment_channel: channel };
+
+  return { ok: true, status, raw: result.data, payment_method: paymentMethod, payment_channel: channel };
 }
 
 app.get("/health", (_req, res) => res.json({ ok: true, service: "ziloshift-hubtel-gateway" }));

@@ -5,6 +5,7 @@ import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import cors from "cors";
 import { verifyGhanaCard, verifyVoterId } from "./verify.js";
+import { sendPersonalizedSms, sendSms } from "./sms.js";
 
 dotenv.config();
 
@@ -332,6 +333,8 @@ const GH_BANKS = [
 const CHECKOUT_PAYMENT_SELECT = [
   "id",
   "venue_user_id",
+  "worker_user_id",
+  "shift_id",
   "collection_provider",
   "collection_reference",
   "collection_external_id",
@@ -339,6 +342,10 @@ const CHECKOUT_PAYMENT_SELECT = [
   "collection_checkout_direct_url",
   "collection_payment_method",
   "collection_payment_channel",
+  "payout_provider",
+  "worker_payout",
+  "amount",
+  "currency",
   "created_at",
   "status",
 ].join(",");
@@ -382,6 +389,38 @@ async function markVenueBillingConnected(venueUserId) {
   if (error) {
     console.error(`[VENUE BILLING ERROR] Failed to update venue ${venueUserId}:`, error);
   }
+}
+
+async function markWorkerProfilePromoted(payment) {
+  if (!payment?.worker_user_id) return { promoted: false };
+  const externalId = `hubtel:${payment.collection_reference || payment.collection_external_id || payment.id}`;
+  const { data: existing } = await supabase
+    .from("profile_promotions")
+    .select("id")
+    .eq("external_id", externalId)
+    .maybeSingle();
+  if (existing) return { promoted: true, duplicate: true };
+
+  const promotedUntil = new Date();
+  promotedUntil.setDate(promotedUntil.getDate() + 7);
+
+  const { error: workerError } = await supabase
+    .from("workers")
+    .update({ promoted_until: promotedUntil.toISOString() })
+    .eq("user_id", payment.worker_user_id);
+  if (workerError) throw workerError;
+
+  const { error: promotionError } = await supabase.from("profile_promotions").insert({
+    worker_user_id: payment.worker_user_id,
+    amount: Number(payment.amount || 0),
+    currency: String(payment.currency || "GHS").toUpperCase(),
+    provider: "hubtel",
+    external_id: externalId,
+    stripe_session_id: null,
+  });
+  if (promotionError && promotionError.code !== "23505") throw promotionError;
+
+  return { promoted: true, duplicate: false, promoted_until: promotedUntil.toISOString() };
 }
 
 async function reconcileCheckoutPayment(payment) {
@@ -476,7 +515,7 @@ async function reconcileCheckoutWithoutPayment({ venueUserId, checkoutId }) {
   const url = new URL(`${base}/transactions/${encodeURIComponent(collection)}/status`);
   url.searchParams.set("hubtelTransactionId", String(checkoutId));
 
-  console.log(`[CHECKOUT RECOVER] No payment row found; checking Hubtel by checkout id ${checkoutId}`);
+  console.log(`[CHECKOUT RECOVER] No payment row found; checking Billing by checkout id ${checkoutId}`);
   const response = await fetch(url.toString(), {
     method: "GET",
     headers: { Authorization: hubtelAuthHeader("HUBTEL_CHECKOUT"), Accept: "application/json" },
@@ -535,6 +574,26 @@ async function reconcileCheckoutWithoutPayment({ venueUserId, checkoutId }) {
 }
 
 app.get("/health", (_req, res) => res.json({ ok: true, service: "ziloshift-hubtel-gateway" }));
+
+app.post("/api/sms/send", requireGatewayToken, async (req, res) => {
+  try {
+    const { to, content, from } = req.body || {};
+    const result = await sendSms({ to, content, from });
+    return res.status(200).json({ ok: true, result });
+  } catch (error) {
+    return res.status(error.status || 500).json({ error: error.message, details: error.details || null });
+  }
+});
+
+app.post("/api/sms/batch/personalized", requireGatewayToken, async (req, res) => {
+  try {
+    const { recipients, from } = req.body || {};
+    const result = await sendPersonalizedSms({ recipients, from });
+    return res.status(200).json({ ok: true, result });
+  } catch (error) {
+    return res.status(error.status || 500).json({ error: error.message, details: error.details || null });
+  }
+});
 
 app.get("/api/debug/hubtel-config", requireGatewayToken, async (_req, res) => {
   let outboundIp = null;
@@ -616,7 +675,7 @@ app.get("/api/verify-momo-account", requireGatewayToken, async (req, res) => {
     console.log(`[HUBTEL RNV] ${response.status} ${channel} ${normalizeGhMsisdn(phone).slice(0, 5)}***`);
     logHubtelFailure("RNV", response, data);
     if (!response.ok) {
-      return res.status(response.status).json({ error: "Hubtel momo verification failed", details: data });
+      return res.status(response.status).json({ error: "Momo verification failed", details: data });
     }
     return res.json({
       ok: true,
@@ -699,9 +758,9 @@ app.post("/api/direct-debit/preapproval/initiate", requireGatewayToken, async (r
     });
     const data = await response.json().catch(() => ({}));
     logHubtelFailure("DIRECT_DEBIT_PREAPPROVAL_INITIATE", response, data);
-    if (!response.ok) return res.status(response.status).json({ error: "Hubtel preapproval initiate failed", details: data });
+    if (!response.ok) return res.status(response.status).json({ error: "Momo preapproval initiate failed", details: data });
     const rc = String(data?.responseCode ?? data?.ResponseCode ?? "");
-    if (rc && rc !== "2000") return res.status(400).json({ error: "Hubtel preapproval was not accepted", responseCode: rc, details: data });
+    if (rc && rc !== "2000") return res.status(400).json({ error: "Momo preapproval was not accepted", responseCode: rc, details: data });
 
     const d = data?.data ?? data?.Data ?? {};
     await supabase.from("venues").update({
@@ -749,9 +808,9 @@ app.post("/api/direct-debit/preapproval/verify-otp", requireGatewayToken, async 
     });
     const data = await response.json().catch(() => ({}));
     logHubtelFailure("DIRECT_DEBIT_VERIFY_OTP", response, data);
-    if (!response.ok) return res.status(response.status).json({ error: "Hubtel OTP verification failed", details: data });
+    if (!response.ok) return res.status(response.status).json({ error: "Momo OTP verification failed", details: data });
     const rc = String(data?.responseCode ?? data?.ResponseCode ?? "");
-    if (rc && rc !== "2000") return res.status(400).json({ error: "Hubtel OTP verification was not accepted", responseCode: rc, details: data });
+    if (rc && rc !== "2000") return res.status(400).json({ error: "Momo OTP verification was not accepted", responseCode: rc, details: data });
     const d = data?.data ?? data?.Data ?? {};
     await supabase.from("venues").update({
       hubtel_preapproval_status: d.preapprovalStatus || "PENDING",
@@ -772,7 +831,7 @@ app.get("/api/direct-debit/preapproval/status", requireGatewayToken, async (req,
     const response = await fetch(url, { method: "GET", headers: { Authorization: hubtelAuthHeader("HUBTEL_DIRECT_DEBIT"), Accept: "application/json" } });
     const data = await response.json().catch(() => ({}));
     logHubtelFailure("DIRECT_DEBIT_STATUS", response, data);
-    if (!response.ok) return res.status(response.status).json({ error: "Hubtel preapproval status failed", details: data });
+    if (!response.ok) return res.status(response.status).json({ error: "Momo preapproval status failed", details: data });
     return res.json({ ok: true, raw: data });
   } catch (error) {
     return res.status(500).json({ error: error.message });
@@ -809,10 +868,10 @@ app.post("/api/direct-debit/charge", requireGatewayToken, async (req, res) => {
     });
     const data = await response.json().catch(() => ({}));
     logHubtelFailure("DIRECT_DEBIT_CHARGE", response, data);
-    if (!response.ok) return res.status(response.status).json({ error: "Hubtel direct debit charge failed", details: data });
+    if (!response.ok) return res.status(response.status).json({ error: "Momo direct debit charge failed", details: data });
     const rc = String(data?.ResponseCode ?? data?.responseCode ?? "");
     if (rc && rc !== "0001" && rc !== "0000") {
-      return res.status(400).json({ error: "Hubtel direct debit was not accepted", responseCode: rc, details: data });
+      return res.status(400).json({ error: "Momo direct debit was not accepted", responseCode: rc, details: data });
     }
     const transactionId = data?.Data?.TransactionId ?? data?.data?.transactionId ?? null;
     await supabase.from("payments").update({
@@ -868,8 +927,11 @@ app.post("/api/checkout/initiate", requireGatewayToken, async (req, res) => {
     if (!return_url) {
       return res.status(400).json({ error: "return_url is required" });
     }
-    const collectionProvider = purpose === "venue_billing_setup" ? "hubtel_checkout_setup" : "hubtel_checkout";
-    const payoutProvider = purpose === "shift_collection" ? "hubtel_disbursement" : "hubtel_checkout_setup";
+    const isVenueBillingSetup = purpose === "venue_billing_setup";
+    const isShiftCollection = purpose === "shift_collection";
+    const isProfilePromotion = purpose === "profile_promotion";
+    const collectionProvider = isVenueBillingSetup ? "hubtel_checkout_setup" : "hubtel_checkout";
+    const payoutProvider = isShiftCollection ? "hubtel_disbursement" : isProfilePromotion ? "profile_promotion" : "hubtel_checkout_setup";
     const dedupeSince = new Date(Date.now() - 30 * 60 * 1000).toISOString();
     let existingRows = null;
     let existingError = null;
@@ -879,6 +941,16 @@ app.post("/api/checkout/initiate", requireGatewayToken, async (req, res) => {
         .select(CHECKOUT_PAYMENT_SELECT)
         .eq("venue_user_id", venue_user_id)
         .eq("collection_provider", collectionProvider)
+        .gte("created_at", dedupeSince)
+        .order("created_at", { ascending: false })
+        .limit(1));
+    } else if (isProfilePromotion && worker_user_id) {
+      ({ data: existingRows, error: existingError } = await supabase
+        .from("payments")
+        .select(CHECKOUT_PAYMENT_SELECT)
+        .eq("worker_user_id", worker_user_id)
+        .eq("collection_provider", collectionProvider)
+        .eq("payout_provider", payoutProvider)
         .gte("created_at", dedupeSince)
         .order("created_at", { ascending: false })
         .limit(1));
@@ -901,7 +973,7 @@ app.post("/api/checkout/initiate", requireGatewayToken, async (req, res) => {
       const existing = existingRows[0];
       if ((existing.status === "pending" || existing.status === "processing") && existing.collection_reference) {
         const reconciled = await reconcileCheckoutPayment(existing);
-        if (reconciled.status === "captured" && purpose === "venue_billing_setup") {
+        if (reconciled.status === "captured" && isVenueBillingSetup) {
           return res.json({
             ok: true,
             deduped: true,
@@ -910,11 +982,24 @@ app.post("/api/checkout/initiate", requireGatewayToken, async (req, res) => {
             checkout_id: existing.collection_external_id,
             reference: existing.collection_reference,
             payment_method: reconciled.payment_method || null,
-            message: "Hubtel billing profile already verified.",
+            message: "Billing profile already verified.",
+          });
+        }
+        if (reconciled.status === "captured" && isProfilePromotion) {
+          const promotion = await markWorkerProfilePromoted(existing);
+          return res.json({
+            ok: true,
+            deduped: true,
+            promoted: true,
+            status: reconciled.status,
+            checkout_id: existing.collection_external_id,
+            reference: existing.collection_reference,
+            promoted_until: promotion.promoted_until || null,
+            message: "Billing profile promotion already completed.",
           });
         }
       }
-      if (existing.status === "captured" && purpose === "venue_billing_setup") {
+      if (existing.status === "captured" && isVenueBillingSetup) {
         await markVenueBillingConnected(venue_user_id);
         return res.json({
           ok: true,
@@ -923,7 +1008,20 @@ app.post("/api/checkout/initiate", requireGatewayToken, async (req, res) => {
           status: existing.status,
           checkout_id: existing.collection_external_id,
           reference: existing.collection_reference,
-          message: "Hubtel billing profile already verified.",
+          message: "Billing profile already verified.",
+        });
+      }
+      if (existing.status === "captured" && isProfilePromotion) {
+        const promotion = await markWorkerProfilePromoted(existing);
+        return res.json({
+          ok: true,
+          deduped: true,
+          promoted: true,
+          status: existing.status,
+          checkout_id: existing.collection_external_id,
+          reference: existing.collection_reference,
+          promoted_until: promotion.promoted_until || null,
+          message: "Billing profile promotion already completed.",
         });
       }
       if (existing.collection_checkout_url) {
@@ -935,16 +1033,18 @@ app.post("/api/checkout/initiate", requireGatewayToken, async (req, res) => {
           checkout_id: existing.collection_external_id,
           reference: existing.collection_reference,
           status: existing.status,
-          message: purpose === "venue_billing_setup"
-            ? "Existing Hubtel Checkout session returned for this venue."
-            : "Existing Hubtel Checkout session returned for this shift.",
+          message: isVenueBillingSetup
+            ? "Existing Billing Checkout session returned for this venue."
+            : isProfilePromotion
+              ? "Existing Billing Checkout session returned for this profile promotion."
+              : "Existing Billing Checkout session returned for this shift.",
         });
       }
     }
     const clientReference = hubtelCheckoutClientReference(reference);
     const body = {
       totalAmount: Number(Number(amount).toFixed(2)),
-      description: description || "ZiloShift card check (auto-refund)",
+      description: description || (isProfilePromotion ? "ZiloShift profile promotion" : "ZiloShift card check (auto-refund)"),
       callbackUrl: callback,
       returnUrl: return_url,
       merchantAccountNumber: process.env.HUBTEL_MERCHANT_ACCOUNT_NUMBER,
@@ -962,9 +1062,9 @@ app.post("/api/checkout/initiate", requireGatewayToken, async (req, res) => {
     const data = await r.json().catch(() => ({}));
     logHubtelFailure("CHECKOUT_INITIATE", r, data);
     const responseCode = data?.responseCode ?? data?.ResponseCode;
-    if (!r.ok) return res.status(r.status).json({ error: "Hubtel checkout init failed", details: data });
+    if (!r.ok) return res.status(r.status).json({ error: "Billing checkout init failed", details: data });
     if (responseCode && responseCode !== "0000") {
-      return res.status(400).json({ error: "Hubtel checkout did not return success", responseCode, details: data });
+      return res.status(400).json({ error: "Billing checkout did not return success", responseCode, details: data });
     }
 
     const checkoutUrl =
@@ -993,7 +1093,7 @@ app.post("/api/checkout/initiate", requireGatewayToken, async (req, res) => {
       collection_checkout_url: checkoutUrl,
       collection_checkout_direct_url: checkoutDirectUrl,
       payout_provider: payoutProvider,
-      payout_reference: purpose === "venue_billing_setup" ? clientReference : null,
+      payout_reference: isVenueBillingSetup ? clientReference : null,
       amount: Number(amount),
       platform_fee: Number(platform_fee || 0),
       worker_amount: Number(worker_payout || 0),
@@ -1015,7 +1115,7 @@ app.post("/api/checkout/initiate", requireGatewayToken, async (req, res) => {
       }
     }
 
-    if (purpose === "venue_billing_setup" && venue_id && venue_user_id) {
+    if (isVenueBillingSetup && venue_id && venue_user_id) {
       await supabase.from("venues").update({
         stripe_onboarding_complete: false,
         hubtel_billing_type: "online_checkout",
@@ -1028,9 +1128,11 @@ app.post("/api/checkout/initiate", requireGatewayToken, async (req, res) => {
       checkout_direct_url: checkoutDirectUrl,
       checkout_id: checkoutId,
       reference: clientReference,
-      message: purpose === "venue_billing_setup"
-        ? "Open Hubtel Checkout to verify your billing profile with any supported payment option."
-        : "Open Hubtel Checkout to complete payment for this shift.",
+      message: isVenueBillingSetup
+        ? "Open Billing Checkout to verify your billing profile with any supported payment option."
+        : isProfilePromotion
+          ? "Open Billing Checkout to promote your profile for 7 days."
+          : "Open Billing Checkout to complete payment for this shift.",
       raw: data,
     });
   } catch (error) {
@@ -1274,6 +1376,84 @@ app.get("/api/checkout/setup-status", requireGatewayToken, async (req, res) => {
   }
 });
 
+app.get("/api/profile-promotion/status", requireGatewayToken, async (req, res) => {
+  try {
+    assertSupabaseAdminConfigured();
+    const workerUserId = String(req.query.worker_user_id || req.query.workerUserId || "").trim();
+    const reference = String(req.query.reference || "").trim();
+    const checkoutId = String(req.query.checkout_id || req.query.checkoutid || "").trim();
+    if (!workerUserId && !reference && !checkoutId) {
+      return res.status(400).json({ error: "worker_user_id, reference, or checkout_id is required" });
+    }
+
+    let query = supabase
+      .from("payments")
+      .select(CHECKOUT_PAYMENT_SELECT)
+      .eq("collection_provider", "hubtel_checkout")
+      .eq("payout_provider", "profile_promotion")
+      .order("created_at", { ascending: false })
+      .limit(1);
+    if (reference) {
+      query = query.eq("collection_reference", reference);
+      if (workerUserId) query = query.eq("worker_user_id", workerUserId);
+    } else if (checkoutId) {
+      query = query.eq("collection_external_id", checkoutId);
+      if (workerUserId) query = query.eq("worker_user_id", workerUserId);
+    } else {
+      query = query.eq("worker_user_id", workerUserId);
+    }
+
+    let { data: rows, error } = await query;
+    if (error) return res.status(500).json({ error: error.message });
+
+    if (!rows?.[0] && checkoutId && workerUserId) {
+      const fallback = await supabase
+        .from("payments")
+        .select(CHECKOUT_PAYMENT_SELECT)
+        .eq("collection_provider", "hubtel_checkout")
+        .eq("payout_provider", "profile_promotion")
+        .eq("worker_user_id", workerUserId)
+        .order("created_at", { ascending: false })
+        .limit(1);
+      if (fallback.error) return res.status(500).json({ error: fallback.error.message });
+      rows = fallback.data || [];
+    }
+
+    const payment = rows?.[0];
+    if (!payment) return res.json({ ok: true, promoted: false, status: "not_found" });
+
+    if (payment.status === "captured") {
+      const promotion = await markWorkerProfilePromoted(payment);
+      return res.json({
+        ok: true,
+        promoted: true,
+        status: "captured",
+        checkout_id: payment.collection_external_id,
+        reference: payment.collection_reference,
+        promoted_until: promotion.promoted_until || null,
+      });
+    }
+
+    const reconciled = await reconcileCheckoutPayment(payment);
+    const promoted = reconciled.status === "captured" ? await markWorkerProfilePromoted(payment) : null;
+    return res.json({
+      ok: reconciled.ok,
+      promoted: reconciled.status === "captured",
+      status: reconciled.status,
+      checkout_id: payment.collection_external_id,
+      reference: payment.collection_reference,
+      checkout_url: payment.collection_checkout_url || null,
+      checkout_direct_url: payment.collection_checkout_direct_url || null,
+      payment_method: reconciled.payment_method || null,
+      payment_channel: reconciled.payment_channel || null,
+      promoted_until: promoted?.promoted_until || null,
+      raw: reconciled.raw,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
 app.get("/api/transaction-status/send-money", requireGatewayToken, async (req, res) => {
   try {
     const disburseAccount = process.env.HUBTEL_DISBURSEMENT_ACCOUNT_NUMBER;
@@ -1296,7 +1476,7 @@ app.get("/api/transaction-status/send-money", requireGatewayToken, async (req, r
     });
     const data = await response.json().catch(() => ({}));
     logHubtelFailure("DISBURSEMENT_STATUS", response, data);
-    if (!response.ok) return res.status(response.status).json({ error: "Hubtel send-money status failed", details: data });
+    if (!response.ok) return res.status(response.status).json({ error: "Billing send-money status failed", details: data });
     return res.json({ ok: true, raw: data });
   } catch (error) {
     return res.status(500).json({ error: error.message });
@@ -1547,6 +1727,11 @@ app.post("/webhooks/hubtel", async (req, res) => {
 
       if (collectionStatus === "captured" && collectionPayment.collection_provider === "hubtel_checkout_setup" && collectionPayment.venue_user_id) {
         await markVenueBillingConnected(collectionPayment.venue_user_id);
+        return res.json({ ok: true });
+      }
+
+      if (collectionStatus === "captured" && collectionPayment.payout_provider === "profile_promotion" && collectionPayment.worker_user_id) {
+        await markWorkerProfilePromoted(collectionPayment);
         return res.json({ ok: true });
       }
 

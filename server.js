@@ -1307,7 +1307,7 @@ app.post("/api/verify/ghana-card", requireGatewayToken, async (req, res) => {
   try {
     const result = await verifyGhanaCard(req.body?.scan_data || req.body?.card_data, {
       collectionAccountNumber: process.env.HUBTEL_ACCOUNT_NUMBER || process.env.HUBTEL_MERCHANT_ACCOUNT_NUMBER,
-      basicAuthToken: hubtelVerificationAuthToken(),
+      basicAuthToken: hubtelVerificationAuthToken() || hubtelAuthHeader("HUBTEL_RNV"),
     });
     return res.json(result);
   } catch (error) {
@@ -1319,7 +1319,7 @@ app.post("/api/verify/voter-id", requireGatewayToken, async (req, res) => {
   try {
     const result = await verifyVoterId(req.body?.voter_data || req.body, {
       collectionAccountNumber: process.env.HUBTEL_ACCOUNT_NUMBER || process.env.HUBTEL_MERCHANT_ACCOUNT_NUMBER,
-      basicAuthToken: hubtelVerificationAuthToken(),
+      basicAuthToken: hubtelVerificationAuthToken() || hubtelAuthHeader("HUBTEL_RNV"),
     });
     return res.json(result);
   } catch (error) {

@@ -113,8 +113,8 @@ export async function verifyGhanaCard(cardData, config) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        // Hubtel expects Basic <base64(clientId:clientSecret)>
-        Authorization: `Basic ${config.basicAuthToken}`,
+        // Hubtel expects Basic <base64(API_ID:API_KEY)>.
+        Authorization: `Basic ${String(config.basicAuthToken).replace(/^Basic\s+/i, "")}`,
       },
       body: JSON.stringify(payload),
     });
@@ -178,7 +178,7 @@ export async function verifyVoterId(voterData, config) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Basic ${config.basicAuthToken}`,
+        Authorization: `Basic ${String(config.basicAuthToken).replace(/^Basic\s+/i, "")}`,
       },
       body: JSON.stringify({ voterIdCardNumber, surname, othernames, sex, dateOfBirth }),
     });

@@ -4,6 +4,7 @@ import crypto from "crypto";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import cors from "cors";
+import { verifyGhanaCard, verifyVoterId } from "./verify.js";
 
 dotenv.config();
 
@@ -57,6 +58,10 @@ function normalizeBasicAuth(value) {
   const raw = String(value || "").trim();
   if (!raw) return "";
   return raw.toLowerCase().startsWith("basic ") ? raw : `Basic ${raw}`;
+}
+
+function hubtelVerificationAuthToken() {
+  return String(process.env.HUBTEL_AUTH_TOKEN || process.env.HUBTEL_BASIC_AUTH || "").replace(/^Basic\s+/i, "");
 }
 
 function hubtelAuthHeader(scope = "HUBTEL") {
@@ -1295,6 +1300,30 @@ app.get("/api/transaction-status/send-money", requireGatewayToken, async (req, r
     return res.json({ ok: true, raw: data });
   } catch (error) {
     return res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/verify/ghana-card", requireGatewayToken, async (req, res) => {
+  try {
+    const result = await verifyGhanaCard(req.body?.scan_data || req.body?.card_data, {
+      collectionAccountNumber: process.env.HUBTEL_ACCOUNT_NUMBER || process.env.HUBTEL_MERCHANT_ACCOUNT_NUMBER,
+      basicAuthToken: hubtelVerificationAuthToken(),
+    });
+    return res.json(result);
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post("/api/verify/voter-id", requireGatewayToken, async (req, res) => {
+  try {
+    const result = await verifyVoterId(req.body?.voter_data || req.body, {
+      collectionAccountNumber: process.env.HUBTEL_ACCOUNT_NUMBER || process.env.HUBTEL_MERCHANT_ACCOUNT_NUMBER,
+      basicAuthToken: hubtelVerificationAuthToken(),
+    });
+    return res.json(result);
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
   }
 });
 

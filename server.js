@@ -1158,7 +1158,7 @@ app.post("/api/checkout/initiate", requireGatewayToken, async (req, res) => {
       await updatePaymentWithOptionalFields({ id: payment_id }, paymentPatch);
     } else {
       const { error } = await supabase.from("payments").insert(paymentPatch);
-      if (error?.code === "42703") {
+      if (error?.code === "42703" || error?.code === "PGRST204") {
         const { collection_checkout_url, collection_checkout_direct_url, worker_amount, ...fallbackPatch } = paymentPatch;
         const { error: fallbackError } = await supabase.from("payments").insert(fallbackPatch);
         if (fallbackError) throw fallbackError;

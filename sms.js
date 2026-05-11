@@ -68,6 +68,50 @@ async function hubtelSmsRequest(path, payload) {
     const error = new Error("Hubtel SMS request failed");
     error.status = response.status;
     error.details = data;
+    error.payload = {
+      ...payload,
+      Content: payload?.Content ? `[${String(payload.Content).length} chars]` : undefined,
+      personalizedRecipients: Array.isArray(payload?.personalizedRecipients)
+        ? `${payload.personalizedRecipients.length} recipients`
+        : undefined,
+    };
+    throw error;
+  }
+  if (data && typeof data === "object" && data.status != null && Number(data.status) !== 0) {
+    const error = new Error(data.statusDescription || "Hubtel SMS was not accepted");
+    error.status = 400;
+    error.details = data;
+    error.payload = {
+      ...payload,
+      Content: payload?.Content ? `[${String(payload.Content).length} chars]` : undefined,
+      personalizedRecipients: Array.isArray(payload?.personalizedRecipients)
+        ? `${payload.personalizedRecipients.length} recipients`
+        : undefined,
+    };
+    throw error;
+  }
+  return data;
+}
+
+async function hubtelSmsStatusRequest(path) {
+  const response = await fetch(`${smsBaseUrl()}${path}`, {
+    method: "GET",
+    headers: {
+      Authorization: smsAuthHeader(),
+      Accept: "application/json",
+    },
+  });
+  const text = await response.text();
+  let data = {};
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = { raw: text };
+  }
+  if (!response.ok) {
+    const error = new Error("Hubtel SMS status request failed");
+    error.status = response.status;
+    error.details = data;
     throw error;
   }
   return data;
@@ -100,4 +144,30 @@ export async function sendPersonalizedSms({ recipients, from }) {
     From: senderId(from),
     personalizedRecipients,
   });
+}
+
+export async function getSmsStatus(messageId) {
+  const id = String(messageId || "").trim();
+  if (!id) throw new Error("messageId is required");
+  return hubtelSmsStatusRequest(`/v1/messages/${encodeURIComponent(id)}`);
+}
+
+export async function getSmsBatchStatus(batchId) {
+  const id = String(batchId || "").trim();
+  if (!id) throw new Error("batchId is required");
+  return hubtelSmsStatusRequest(`/v1/messages/batch/${encodeURIComponent(id)}`);
+}
+
+export function smsDiagnostics() {
+  return {
+    sms_configured: Boolean(
+      process.env.HUBTEL_SMS_BASIC_AUTH ||
+      (process.env.HUBTEL_SMS_CLIENT_ID && process.env.HUBTEL_SMS_CLIENT_SECRET) ||
+      (process.env.HUBTEL_SMS_API_ID && process.env.HUBTEL_SMS_API_KEY) ||
+      (process.env.HUBTEL_CLIENT_ID && process.env.HUBTEL_CLIENT_SECRET) ||
+      (process.env.HUBTEL_API_ID && process.env.HUBTEL_API_KEY)
+    ),
+    sms_sender_id: senderId(),
+    sms_base_url: smsBaseUrl(),
+  };
 }

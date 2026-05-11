@@ -5,7 +5,7 @@ import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import cors from "cors";
 import { verifyGhanaCard, verifyVoterId } from "./verify.js";
-import { sendPersonalizedSms, sendSms } from "./sms.js";
+import { getSmsBatchStatus, getSmsStatus, sendPersonalizedSms, sendSms, smsDiagnostics } from "./sms.js";
 
 dotenv.config();
 
@@ -614,7 +614,13 @@ app.post("/api/sms/send", requireGatewayToken, async (req, res) => {
     const result = await sendSms({ to, content, from });
     return res.status(200).json({ ok: true, result });
   } catch (error) {
-    return res.status(error.status || 500).json({ error: error.message, details: error.details || null });
+    console.error("[SMS SEND ERROR]", {
+      status: error.status || 500,
+      message: error.message,
+      details: error.details || null,
+      payload: error.payload || null,
+    });
+    return res.status(error.status || 500).json({ error: error.message, details: error.details || null, payload: error.payload || null });
   }
 });
 
@@ -624,6 +630,40 @@ app.post("/api/sms/batch/personalized", requireGatewayToken, async (req, res) =>
     const result = await sendPersonalizedSms({ recipients, from });
     return res.status(200).json({ ok: true, result });
   } catch (error) {
+    console.error("[SMS BATCH ERROR]", {
+      status: error.status || 500,
+      message: error.message,
+      details: error.details || null,
+      payload: error.payload || null,
+    });
+    return res.status(error.status || 500).json({ error: error.message, details: error.details || null, payload: error.payload || null });
+  }
+});
+
+app.get("/api/sms/status/:messageId", requireGatewayToken, async (req, res) => {
+  try {
+    const result = await getSmsStatus(req.params.messageId);
+    return res.status(200).json({ ok: true, result });
+  } catch (error) {
+    console.error("[SMS STATUS ERROR]", {
+      status: error.status || 500,
+      message: error.message,
+      details: error.details || null,
+    });
+    return res.status(error.status || 500).json({ error: error.message, details: error.details || null });
+  }
+});
+
+app.get("/api/sms/batch/:batchId", requireGatewayToken, async (req, res) => {
+  try {
+    const result = await getSmsBatchStatus(req.params.batchId);
+    return res.status(200).json({ ok: true, result });
+  } catch (error) {
+    console.error("[SMS BATCH STATUS ERROR]", {
+      status: error.status || 500,
+      message: error.message,
+      details: error.details || null,
+    });
     return res.status(error.status || 500).json({ error: error.message, details: error.details || null });
   }
 });
@@ -656,7 +696,9 @@ app.get("/api/debug/hubtel-config", requireGatewayToken, async (_req, res) => {
       rnv_configured: hasCredential("HUBTEL_RNV"),
       disbursement_configured: hasCredential("HUBTEL_DISBURSEMENT"),
       refund_configured: hasCredential("HUBTEL_REFUND"),
+      sms_configured: smsDiagnostics().sms_configured,
     },
+    sms: smsDiagnostics(),
     endpoints: {
       checkout_base_url: process.env.HUBTEL_CHECKOUT_BASE_URL || "https://payproxyapi.hubtel.com",
       refund_base_url: process.env.HUBTEL_REFUND_BASE_URL || "https://refund-api.hubtel.com",

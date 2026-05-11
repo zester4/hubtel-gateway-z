@@ -1886,7 +1886,10 @@ app.post("/webhooks/hubtel", async (req, res) => {
             payment_id: collectionPayment.id,
           });
         } catch (payoutError) {
-          await supabase.from("payments").update({ status: "failed" }).eq("id", collectionPayment.id);
+          await supabase.from("payments").update({
+            status: "captured",
+            payout_provider: collectionPayment.payout_provider || "hubtel_disbursement",
+          }).eq("id", collectionPayment.id);
           console.error("Hubtel payout after collection failed:", payoutError);
         }
       }

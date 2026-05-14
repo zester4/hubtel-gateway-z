@@ -195,14 +195,23 @@ function mapHubtelRefundStatus(payload) {
 function mapHubtelWebhookStatus(payload) {
   const rc = String(payload?.ResponseCode ?? payload?.responseCode ?? "").trim();
   const data = payload?.Data ?? payload?.data ?? {};
-  const dataStatus = String(data?.Status ?? data?.status ?? "").toLowerCase();
-  const topStatus = String(payload?.Status ?? payload?.status ?? "").toLowerCase();
+  const values = [
+    data?.Status,
+    data?.status,
+    data?.TransactionStatus,
+    data?.transactionStatus,
+    data?.StatusDescription,
+    data?.statusDescription,
+    payload?.Status,
+    payload?.status,
+    payload?.Message,
+    payload?.message,
+  ].map((value) => String(value ?? "").trim().toLowerCase()).filter(Boolean);
+  const statusText = values.join(" ");
 
-  if (rc === "0000") return "paid_out";
-  if (rc === "0001") return "processing";
-  if (rc && rc !== "0000" && rc !== "0001") return "failed";
-  if (dataStatus.includes("success") || topStatus.includes("success") || dataStatus === "paid") return "paid_out";
-  if (dataStatus.includes("fail") || topStatus.includes("fail")) return "failed";
+  if (rc === "0000" || values.some((value) => ["success", "successful", "paid", "paid_out", "completed", "processed"].includes(value)) || statusText.includes("success")) return "paid_out";
+  if (rc === "0001" || values.some((value) => ["pending", "processing", "queued", "accepted"].includes(value)) || statusText.includes("pending") || statusText.includes("processing")) return "processing";
+  if (values.some((value) => ["failed", "fail", "rejected", "declined", "cancelled", "canceled", "reversed"].includes(value)) || statusText.includes("fail") || statusText.includes("reject") || statusText.includes("declin")) return "failed";
   return "processing";
 }
 

@@ -1353,7 +1353,7 @@ async function reconcileHubtelBalanceTransfer(reference) {
     hubtel_transfer_checked_at: new Date().toISOString(),
     hubtel_transfer_external_id: externalId != null ? String(externalId) : null,
     hubtel_transfer_failure_reason: failureReason,
-    status: transferStatus === "failed" ? "failed" : "processing",
+    status: transferStatus === "failed" ? "captured" : "processing",
   };
   if (transferStatus === "transferred") {
     patch.hubtel_transfer_completed_at = new Date().toISOString();
@@ -1375,6 +1375,27 @@ function scheduleHubtelTransferStatusCheck(reference) {
     reconcileHubtelBalanceTransfer(reference).catch((error) => {
       console.error("Hubtel balance transfer delayed status check failed:", error);
     });
+  }, Math.max(1000, delay));
+  if (typeof timer.unref === "function") timer.unref();
+}
+
+function scheduleHubtelPayoutFunding(paymentId) {
+  const delay = Number(process.env.HUBTEL_TRANSFER_INIT_DELAY_MS || 5 * 60 * 1000);
+  const timer = setTimeout(async () => {
+    try {
+      const { data: payment, error } = await supabase.from("payments").select("*").eq("id", paymentId).maybeSingle();
+      if (error) throw error;
+      if (!payment) return;
+      await initiateHubtelPayoutFunding(payment);
+    } catch (error) {
+      await updatePaymentWithOptionalFields({ id: paymentId }, {
+        status: "captured",
+        hubtel_transfer_status: "failed",
+        hubtel_transfer_checked_at: new Date().toISOString(),
+        hubtel_transfer_failure_reason: error?.details ? JSON.stringify(redactHubtelDetails(error.details)).slice(0, 1000) : error?.message || "Hubtel balance transfer failed",
+      });
+      console.error("Hubtel delayed payout funding failed:", error);
+    }
   }, Math.max(1000, delay));
   if (typeof timer.unref === "function") timer.unref();
 }
@@ -1407,7 +1428,7 @@ async function initiateHubtelPayoutFunding(payment) {
   const externalId = data.id || data.Id || null;
   const failureReason = transferStatus === "failed" ? transferFailureReason(result.data) : null;
   await updatePaymentWithOptionalFields({ id: payment.id }, {
-    status: transferStatus === "failed" ? "failed" : "processing",
+    status: transferStatus === "failed" ? "captured" : "processing",
     payout_provider: "hubtel_disbursement",
     hubtel_transfer_reference: result.clientReference,
     hubtel_transfer_external_id: externalId != null ? String(externalId) : null,
@@ -2150,18 +2171,15 @@ app.post("/webhooks/hubtel", async (req, res) => {
       }
 
       if (collectionStatus === "captured" && collectionPayment.worker_user_id && Number(collectionPayment.worker_payout) > 0) {
-        try {
-          await initiateHubtelPayoutFunding(collectionPayment);
-        } catch (fundingError) {
-          await updatePaymentWithOptionalFields({ id: collectionPayment.id }, {
-            status: "failed",
-            payout_provider: collectionPayment.payout_provider || "hubtel_disbursement",
-            hubtel_transfer_status: "failed",
-            hubtel_transfer_checked_at: new Date().toISOString(),
-            hubtel_transfer_failure_reason: fundingError?.message || "Hubtel balance transfer failed",
-          });
-          console.error("Hubtel payout funding after collection failed:", fundingError);
-        }
+        await updatePaymentWithOptionalFields({ id: collectionPayment.id }, {
+          status: "captured",
+          payout_provider: collectionPayment.payout_provider || "hubtel_disbursement",
+          hubtel_transfer_status: collectionPayment.hubtel_transfer_reference ? collectionPayment.hubtel_transfer_status || "processing" : "pending",
+          hubtel_transfer_amount: Number(collectionPayment.worker_payout),
+          hubtel_transfer_checked_at: null,
+          hubtel_transfer_failure_reason: null,
+        });
+        scheduleHubtelPayoutFunding(collectionPayment.id);
       }
 
       return res.json({ ok: true });

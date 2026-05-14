@@ -6,6 +6,14 @@ import { createClient } from "@supabase/supabase-js";
 import cors from "cors";
 import { verifyGhanaCard, verifyVoterId } from "./verify.js";
 import { getSmsBatchStatus, getSmsStatus, sendPersonalizedSms, sendSms, smsDiagnostics } from "./sms.js";
+import {
+  checkBalanceTransferStatus,
+  getCollectionBalance,
+  getDisbursementBalance,
+  initiateBalanceTransfer,
+  mapBalanceTransferStatus,
+  transferFailureReason,
+} from "./mbtransfer.js";
 
 dotenv.config();
 
@@ -302,6 +310,15 @@ function callbackUrl() {
   return url;
 }
 
+function transferCallbackUrl() {
+  if (process.env.HUBTEL_TRANSFER_CALLBACK_URL) return process.env.HUBTEL_TRANSFER_CALLBACK_URL;
+  const base = callbackUrl();
+  if (/\/webhooks\/hubtel\/?$/i.test(base)) {
+    return base.replace(/\/webhooks\/hubtel\/?$/i, "/webhooks/hubtel/transfer");
+  }
+  return `${base.replace(/\/$/, "")}/transfer`;
+}
+
 const GH_MOMO_CHANNELS = [
   { id: "mtn-gh", label: "MTN Mobile Money" },
   { id: "vodafone-gh", label: "Telecel Cash" },
@@ -375,13 +392,20 @@ async function fetchHubtelJson(url, body, method = "POST") {
 
 async function updatePaymentWithOptionalFields(matcher, patch) {
   const { error } = await supabase.from("payments").update(patch).match(matcher);
-  if (error?.code === "42703") {
+  if (error?.code === "42703" || error?.code === "PGRST204") {
     const fallbackPatch = { ...patch };
     delete fallbackPatch.collection_checkout_url;
     delete fallbackPatch.collection_checkout_direct_url;
     delete fallbackPatch.collection_payment_method;
     delete fallbackPatch.collection_payment_channel;
     delete fallbackPatch.worker_amount;
+    delete fallbackPatch.hubtel_transfer_reference;
+    delete fallbackPatch.hubtel_transfer_external_id;
+    delete fallbackPatch.hubtel_transfer_status;
+    delete fallbackPatch.hubtel_transfer_amount;
+    delete fallbackPatch.hubtel_transfer_checked_at;
+    delete fallbackPatch.hubtel_transfer_completed_at;
+    delete fallbackPatch.hubtel_transfer_failure_reason;
     const { error: fallbackError } = await supabase.from("payments").update(fallbackPatch).match(matcher);
     if (fallbackError) throw fallbackError;
   } else if (error) {
@@ -1243,6 +1267,185 @@ app.post("/api/checkout/initiate", requireGatewayToken, async (req, res) => {
   }
 });
 
+function hubtelTransferReferenceForPayment(payment) {
+  const base = String(payment?.shift_id || payment?.id || crypto.randomUUID()).replace(/-/g, "").slice(0, 14);
+  return `ztr_${base}_${Date.now().toString(36)}`.slice(0, 36);
+}
+
+function hubtelPayoutReferenceForPayment(payment) {
+  const base = String(payment?.shift_id || payment?.id || crypto.randomUUID()).replace(/-/g, "").slice(0, 14);
+  return `zpo_${base}_${Date.now().toString(36)}`.slice(0, 36);
+}
+
+async function workerRecipientForPayment(payment) {
+  if (!payment?.worker_user_id) throw new Error("Payment has no worker user id");
+  const { data: worker, error } = await supabase
+    .from("workers")
+    .select("hubtel_payout_type, hubtel_mobile_provider, hubtel_mobile_number, hubtel_mobile_account_name, hubtel_bank_code, hubtel_bank_name, hubtel_bank_account_number, hubtel_bank_account_name")
+    .eq("user_id", payment.worker_user_id)
+    .maybeSingle();
+  if (error) throw error;
+  if (!worker) throw new Error("Worker payout profile not found");
+
+  return worker?.hubtel_payout_type === "bank"
+    ? {
+      type: "bank",
+      bank_code: worker?.hubtel_bank_code || null,
+      bank_name: worker?.hubtel_bank_name || null,
+      account_number: worker?.hubtel_bank_account_number || null,
+      account_name: worker?.hubtel_bank_account_name || null,
+    }
+    : {
+      type: "mobile_money",
+      provider: worker?.hubtel_mobile_provider || "mtn-gh",
+      phone: worker?.hubtel_mobile_number || null,
+      account_name: worker?.hubtel_mobile_account_name || null,
+    };
+}
+
+async function initiateWorkerPayoutAfterTransfer(payment) {
+  if (!payment?.id || !payment?.worker_user_id || Number(payment.worker_payout || 0) <= 0) return { skipped: true };
+  const existingPayoutReference = String(payment.payout_reference || "");
+  if (
+    payment.status === "paid_out" ||
+    existingPayoutReference.startsWith("zpo_") ||
+    payment.payout_external_id
+  ) {
+    return { skipped: true, reason: "payout_already_started" };
+  }
+
+  const recipient = await workerRecipientForPayment(payment);
+  return initiateHubtelDisbursement({
+    reference: hubtelPayoutReferenceForPayment(payment),
+    amount: payment.worker_payout,
+    currency: payment.currency || "GHS",
+    worker_user_id: payment.worker_user_id,
+    shift_id: payment.shift_id,
+    recipient,
+    payment_id: payment.id,
+  });
+}
+
+async function reconcileHubtelBalanceTransfer(reference) {
+  if (!reference) throw new Error("Transfer reference is required");
+  const { data: payment, error } = await supabase
+    .from("payments")
+    .select("*")
+    .eq("hubtel_transfer_reference", String(reference))
+    .maybeSingle();
+  if (error) throw error;
+  if (!payment) return { ok: false, status: "not_found" };
+
+  const result = await checkBalanceTransferStatus({
+    collectionAccount: requireCollectionAccount(),
+    reference,
+  });
+  if (!result.ok) {
+    return { ok: false, status: payment.hubtel_transfer_status || "processing", raw: result.data };
+  }
+
+  const transferStatus = mapBalanceTransferStatus(result.data);
+  const data = result.data?.Data || result.data?.data || {};
+  const externalId = data.id || data.Id || payment.hubtel_transfer_external_id || null;
+  const failureReason = transferStatus === "failed" ? transferFailureReason(result.data) : null;
+  const patch = {
+    hubtel_transfer_status: transferStatus,
+    hubtel_transfer_checked_at: new Date().toISOString(),
+    hubtel_transfer_external_id: externalId != null ? String(externalId) : null,
+    hubtel_transfer_failure_reason: failureReason,
+    status: transferStatus === "failed" ? "failed" : "processing",
+  };
+  if (transferStatus === "transferred") {
+    patch.hubtel_transfer_completed_at = new Date().toISOString();
+  }
+  await updatePaymentWithOptionalFields({ id: payment.id }, patch);
+
+  if (transferStatus !== "transferred") {
+    return { ok: true, status: transferStatus, raw: result.data };
+  }
+
+  const { data: refreshedPayment } = await supabase.from("payments").select("*").eq("id", payment.id).maybeSingle();
+  const payout = await initiateWorkerPayoutAfterTransfer(refreshedPayment || payment);
+  return { ok: true, status: transferStatus, payout, raw: result.data };
+}
+
+function scheduleHubtelTransferStatusCheck(reference) {
+  const delay = Number(process.env.HUBTEL_TRANSFER_STATUS_CHECK_DELAY_MS || 5 * 60 * 1000);
+  const timer = setTimeout(() => {
+    reconcileHubtelBalanceTransfer(reference).catch((error) => {
+      console.error("Hubtel balance transfer delayed status check failed:", error);
+    });
+  }, Math.max(1000, delay));
+  if (typeof timer.unref === "function") timer.unref();
+}
+
+async function initiateHubtelPayoutFunding(payment) {
+  if (!payment?.id || !payment?.worker_user_id || Number(payment.worker_payout || 0) <= 0) return { skipped: true };
+  if (payment.hubtel_transfer_status === "transferred") {
+    return initiateWorkerPayoutAfterTransfer(payment);
+  }
+  if (
+    payment.hubtel_transfer_reference &&
+    ["pending", "processing"].includes(String(payment.hubtel_transfer_status || "processing"))
+  ) {
+    return { skipped: true, status: payment.hubtel_transfer_status || "processing", reference: payment.hubtel_transfer_reference };
+  }
+
+  const reference = hubtelTransferReferenceForPayment(payment);
+  const amount = Number(Number(payment.worker_payout).toFixed(2));
+  const result = await initiateBalanceTransfer({
+    collectionAccount: requireCollectionAccount(),
+    disbursementAccount: requireDisbursementAccount(),
+    value: amount,
+    reference,
+    callbackUrl: transferCallbackUrl(),
+    description: `ZiloShift payout funding ${payment.shift_id || payment.id}`,
+  });
+
+  const transferStatus = mapBalanceTransferStatus(result.data);
+  const data = result.data?.Data || result.data?.data || {};
+  const externalId = data.id || data.Id || null;
+  const failureReason = transferStatus === "failed" ? transferFailureReason(result.data) : null;
+  await updatePaymentWithOptionalFields({ id: payment.id }, {
+    status: transferStatus === "failed" ? "failed" : "processing",
+    payout_provider: "hubtel_disbursement",
+    hubtel_transfer_reference: result.clientReference,
+    hubtel_transfer_external_id: externalId != null ? String(externalId) : null,
+    hubtel_transfer_status: transferStatus,
+    hubtel_transfer_amount: amount,
+    hubtel_transfer_checked_at: new Date().toISOString(),
+    hubtel_transfer_completed_at: transferStatus === "transferred" ? new Date().toISOString() : null,
+    hubtel_transfer_failure_reason: failureReason,
+  });
+
+  if (!result.ok || transferStatus === "failed") {
+    const err = new Error("Hubtel balance transfer was not accepted");
+    err.details = result.data;
+    err.status = result.status || 400;
+    throw err;
+  }
+
+  if (transferStatus === "transferred") {
+    const { data: refreshedPayment } = await supabase.from("payments").select("*").eq("id", payment.id).maybeSingle();
+    return initiateWorkerPayoutAfterTransfer(refreshedPayment || { ...payment, hubtel_transfer_status: transferStatus });
+  }
+
+  scheduleHubtelTransferStatusCheck(result.clientReference);
+  if (payment.worker_user_id) {
+    await supabase.from("notifications").insert({
+      user_id: payment.worker_user_id,
+      title: "Payout funding started",
+      subtitle: "Your payout is being funded from the venue payment before it is sent to you.",
+      type: "payment_update",
+      icon: "wallet",
+      deep_link: "/worker/earnings",
+      metadata: { reference: result.clientReference, shift_id: payment.shift_id, provider: "hubtel_balance_transfer" },
+    });
+  }
+
+  return { transfer_reference: result.clientReference, status: transferStatus, raw: result.data };
+}
+
 async function initiateHubtelDisbursement({ reference, amount, currency = "GHS", worker_user_id, shift_id, recipient, payment_id }) {
   callbackUrl();
   const disburseAccount = requireDisbursementAccount();
@@ -1364,6 +1567,43 @@ app.post("/api/disburse", requireGatewayToken, async (req, res) => {
       client_reference: result.clientReference,
       raw: result.data,
     });
+  } catch (error) {
+    return res.status(error.status || 500).json({ error: error.message, details: error.details });
+  }
+});
+
+app.get("/api/balance-transfer/balances", requireGatewayToken, async (_req, res) => {
+  try {
+    const [collection, disbursement] = await Promise.all([
+      getCollectionBalance({ collectionAccount: requireCollectionAccount() }),
+      getDisbursementBalance({ disbursementAccount: requireDisbursementAccount() }),
+    ]);
+    return res.json({
+      ok: collection.ok && disbursement.ok,
+      collection: collection.data,
+      disbursement: disbursement.data,
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({ error: error.message, details: error.details });
+  }
+});
+
+app.get("/api/balance-transfer/status", requireGatewayToken, async (req, res) => {
+  try {
+    let reference = String(req.query.clientReference || req.query.reference || "").trim();
+    const paymentId = String(req.query.payment_id || "").trim();
+    if (!reference && paymentId) {
+      const { data: payment, error } = await supabase
+        .from("payments")
+        .select("hubtel_transfer_reference")
+        .eq("id", paymentId)
+        .maybeSingle();
+      if (error) throw error;
+      reference = String(payment?.hubtel_transfer_reference || "");
+    }
+    if (!reference) return res.status(400).json({ error: "clientReference/reference or payment_id is required" });
+    const result = await reconcileHubtelBalanceTransfer(reference);
+    return res.json(result);
   } catch (error) {
     return res.status(error.status || 500).json({ error: error.message, details: error.details });
   }
@@ -1788,6 +2028,51 @@ app.post("/webhooks/hubtel/refund", async (req, res) => {
   }
 });
 
+app.post("/webhooks/hubtel/transfer", async (req, res) => {
+  try {
+    const signature = req.header("x-hubtel-signature");
+    if (process.env.HUBTEL_WEBHOOK_SECRET && signature) {
+      const body = JSON.stringify(req.body);
+      const expected = crypto.createHmac("sha256", process.env.HUBTEL_WEBHOOK_SECRET).update(body).digest("hex");
+      if (expected !== signature) return res.status(401).json({ error: "Invalid signature" });
+    }
+
+    const payload = req.body || {};
+    const data = payload.Data || payload.data || {};
+    const reference = data.ClientReference || data.clientReference || payload.ClientReference || payload.clientReference;
+    if (!reference) return res.status(400).json({ error: "Transfer ClientReference missing" });
+
+    const { data: payment, error } = await supabase
+      .from("payments")
+      .select("*")
+      .eq("hubtel_transfer_reference", String(reference))
+      .maybeSingle();
+    if (error) throw error;
+    if (!payment) return res.json({ ok: true, matched: false });
+
+    const transferStatus = mapBalanceTransferStatus(payload);
+    const externalId = data.id || data.Id || payment.hubtel_transfer_external_id || null;
+    const failureReason = transferStatus === "failed" ? transferFailureReason(payload) : null;
+    await updatePaymentWithOptionalFields({ id: payment.id }, {
+      status: transferStatus === "failed" ? "failed" : "processing",
+      hubtel_transfer_status: transferStatus,
+      hubtel_transfer_external_id: externalId != null ? String(externalId) : null,
+      hubtel_transfer_checked_at: new Date().toISOString(),
+      hubtel_transfer_completed_at: transferStatus === "transferred" ? new Date().toISOString() : null,
+      hubtel_transfer_failure_reason: failureReason,
+    });
+
+    if (transferStatus === "transferred") {
+      const { data: refreshedPayment } = await supabase.from("payments").select("*").eq("id", payment.id).maybeSingle();
+      await initiateWorkerPayoutAfterTransfer(refreshedPayment || payment);
+    }
+
+    return res.json({ ok: true, status: transferStatus });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
 app.post("/webhooks/hubtel", async (req, res) => {
   try {
     const signature = req.header("x-hubtel-signature");
@@ -1865,41 +2150,17 @@ app.post("/webhooks/hubtel", async (req, res) => {
       }
 
       if (collectionStatus === "captured" && collectionPayment.worker_user_id && Number(collectionPayment.worker_payout) > 0) {
-        const { data: worker } = await supabase
-          .from("workers")
-          .select("hubtel_payout_type, hubtel_mobile_provider, hubtel_mobile_number, hubtel_mobile_account_name, hubtel_bank_code, hubtel_bank_name, hubtel_bank_account_number, hubtel_bank_account_name")
-          .eq("user_id", collectionPayment.worker_user_id)
-          .maybeSingle();
-        const recipient = worker?.hubtel_payout_type === "bank"
-          ? {
-            type: "bank",
-            bank_code: worker?.hubtel_bank_code || null,
-            bank_name: worker?.hubtel_bank_name || null,
-            account_number: worker?.hubtel_bank_account_number || null,
-            account_name: worker?.hubtel_bank_account_name || null,
-          }
-          : {
-            type: "mobile_money",
-            provider: worker?.hubtel_mobile_provider || "mtn-gh",
-            phone: worker?.hubtel_mobile_number || null,
-            account_name: worker?.hubtel_mobile_account_name || null,
-          };
         try {
-          await initiateHubtelDisbursement({
-            reference: `zpo_${String(collectionPayment.shift_id || collectionPayment.id).replace(/-/g, "").slice(0, 14)}_${Date.now().toString(36)}`,
-            amount: collectionPayment.worker_payout,
-            currency: collectionPayment.currency || "GHS",
-            worker_user_id: collectionPayment.worker_user_id,
-            shift_id: collectionPayment.shift_id,
-            recipient,
-            payment_id: collectionPayment.id,
-          });
-        } catch (payoutError) {
-          await supabase.from("payments").update({
-            status: "captured",
+          await initiateHubtelPayoutFunding(collectionPayment);
+        } catch (fundingError) {
+          await updatePaymentWithOptionalFields({ id: collectionPayment.id }, {
+            status: "failed",
             payout_provider: collectionPayment.payout_provider || "hubtel_disbursement",
-          }).eq("id", collectionPayment.id);
-          console.error("Hubtel payout after collection failed:", payoutError);
+            hubtel_transfer_status: "failed",
+            hubtel_transfer_checked_at: new Date().toISOString(),
+            hubtel_transfer_failure_reason: fundingError?.message || "Hubtel balance transfer failed",
+          });
+          console.error("Hubtel payout funding after collection failed:", fundingError);
         }
       }
 

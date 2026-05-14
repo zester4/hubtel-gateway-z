@@ -77,10 +77,28 @@ async function hubtelSmsRequest(path, payload) {
     };
     throw error;
   }
-  if (data && typeof data === "object" && data.status != null && Number(data.status) !== 0) {
+  const providerStatus = data && typeof data === "object" && data.status != null ? Number(data.status) : 0;
+  const messageId = data?.messageId || data?.MessageId || null;
+  if (providerStatus !== 0 && messageId) {
+    return {
+      ...data,
+      accepted: true,
+      provider_warning: data.statusDescription || data.message || `Hubtel returned status ${providerStatus}`,
+    };
+  }
+  if (providerStatus === 12 && !messageId) {
+    return {
+      ...data,
+      accepted: false,
+      retryable: true,
+      provider_warning: data.statusDescription || "Hubtel SMS account requires payment/top-up",
+    };
+  }
+  if (providerStatus !== 0) {
     const error = new Error(data.statusDescription || "Hubtel SMS was not accepted");
     error.status = 400;
     error.details = data;
+    error.retryable = providerStatus === 12;
     error.payload = {
       ...payload,
       Content: payload?.Content ? `[${String(payload.Content).length} chars]` : undefined,

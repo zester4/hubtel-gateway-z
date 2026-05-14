@@ -645,15 +645,37 @@ app.post("/api/sms/send", requireGatewayToken, async (req, res) => {
   try {
     const { to, content, from } = req.body || {};
     const result = await sendSms({ to, content, from });
+    if (result?.accepted === false && result?.retryable) {
+      console.warn("[SMS SEND RETRYABLE]", {
+        status: result.status ?? null,
+        message: result.provider_warning || result.statusDescription || "Hubtel SMS not accepted yet",
+        details: result,
+      });
+      return res.status(202).json({
+        ok: false,
+        retryable: true,
+        error: result.provider_warning || result.statusDescription || "Hubtel SMS not accepted yet",
+        details: result,
+      });
+    }
     return res.status(200).json({ ok: true, result });
   } catch (error) {
-    console.error("[SMS SEND ERROR]", {
+    const retryable = error.retryable === true;
+    const logPayload = {
       status: error.status || 500,
       message: error.message,
       details: error.details || null,
       payload: error.payload || null,
+    };
+    if (retryable) console.warn("[SMS SEND RETRYABLE]", logPayload);
+    else console.error("[SMS SEND ERROR]", logPayload);
+    return res.status(retryable ? 202 : error.status || 500).json({
+      ok: false,
+      retryable,
+      error: error.message,
+      details: error.details || null,
+      payload: error.payload || null,
     });
-    return res.status(error.status || 500).json({ error: error.message, details: error.details || null, payload: error.payload || null });
   }
 });
 

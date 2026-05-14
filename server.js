@@ -1572,7 +1572,7 @@ async function initiateHubtelDisbursement({ reference, amount, currency = "GHS",
     payout_provider: "hubtel_disbursement",
     payout_external_id: transactionId,
     payout_reference: clientReference,
-    status: rc === "0000" ? "paid_out" : "processing",
+    status: rc === "0000" ? "paid_out" : "captured",
   };
 
   if (payment_id) {
@@ -2234,7 +2234,7 @@ app.post("/webhooks/hubtel", async (req, res) => {
     if (clientReference) {
       const { data: payoutPayment } = await supabase
         .from("payments")
-        .select("id,payout_provider")
+        .select("id,payout_provider,collection_provider,collection_external_id")
         .eq("payout_reference", String(clientReference))
         .maybeSingle();
       if (payoutPayment?.payout_provider === "hubtel_preauth" || payoutPayment?.payout_provider === "hubtel_checkout_setup") {
@@ -2251,11 +2251,22 @@ app.post("/webhooks/hubtel", async (req, res) => {
           }
         }
       } else {
-        await supabase.from("payments").update({ status }).eq("payout_reference", String(clientReference));
+        const visibleStatus = status === "processing" && payoutPayment?.collection_provider === "hubtel_checkout" && payoutPayment?.collection_external_id
+          ? "captured"
+          : status;
+        await supabase.from("payments").update({ status: visibleStatus }).eq("payout_reference", String(clientReference));
       }
     }
     if (transactionId != null) {
-      await supabase.from("payments").update({ status }).eq("payout_external_id", String(transactionId));
+      const { data: payoutPayment } = await supabase
+        .from("payments")
+        .select("id,collection_provider,collection_external_id")
+        .eq("payout_external_id", String(transactionId))
+        .maybeSingle();
+      const visibleStatus = status === "processing" && payoutPayment?.collection_provider === "hubtel_checkout" && payoutPayment?.collection_external_id
+        ? "captured"
+        : status;
+      await supabase.from("payments").update({ status: visibleStatus }).eq("payout_external_id", String(transactionId));
     }
 
     return res.json({ ok: true });

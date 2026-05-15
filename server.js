@@ -1386,9 +1386,8 @@ async function reconcileHubtelBalanceTransfer(reference) {
     return { ok: true, status: transferStatus, raw: result.data };
   }
 
-  const { data: refreshedPayment } = await supabase.from("payments").select("*").eq("id", payment.id).maybeSingle();
-  const payout = await initiateWorkerPayoutAfterTransfer(refreshedPayment || payment);
-  return { ok: true, status: transferStatus, payout, raw: result.data };
+  scheduleHubtelWorkerPayoutAfterTransfer(payment.id);
+  return { ok: true, status: transferStatus, payout: { scheduled: true }, raw: result.data };
 }
 
 function scheduleHubtelTransferStatusCheck(reference) {
@@ -1422,10 +1421,31 @@ function scheduleHubtelPayoutFunding(paymentId) {
   if (typeof timer.unref === "function") timer.unref();
 }
 
+function scheduleHubtelWorkerPayoutAfterTransfer(paymentId) {
+  const delay = Number(process.env.HUBTEL_PAYOUT_AFTER_TRANSFER_DELAY_MS || 60 * 60 * 1000);
+  const timer = setTimeout(async () => {
+    try {
+      const { data: payment, error } = await supabase.from("payments").select("*").eq("id", paymentId).maybeSingle();
+      if (error) throw error;
+      if (!payment) return;
+      await initiateWorkerPayoutAfterTransfer(payment);
+    } catch (error) {
+      await updatePaymentWithOptionalFields({ id: paymentId }, {
+        status: "captured",
+        hubtel_transfer_checked_at: new Date().toISOString(),
+        hubtel_transfer_failure_reason: error?.details ? JSON.stringify(redactHubtelDetails(error.details)).slice(0, 1000) : error?.message || "Hubtel worker payout failed after transfer",
+      });
+      console.error("Hubtel delayed worker payout failed:", error);
+    }
+  }, Math.max(1000, delay));
+  if (typeof timer.unref === "function") timer.unref();
+}
+
 async function initiateHubtelPayoutFunding(payment) {
   if (!payment?.id || !payment?.worker_user_id || Number(payment.worker_payout || 0) <= 0) return { skipped: true };
   if (payment.hubtel_transfer_status === "transferred") {
-    return initiateWorkerPayoutAfterTransfer(payment);
+    scheduleHubtelWorkerPayoutAfterTransfer(payment.id);
+    return { scheduled: true, reason: "transfer_already_completed" };
   }
   if (
     payment.hubtel_transfer_reference &&
@@ -1470,7 +1490,8 @@ async function initiateHubtelPayoutFunding(payment) {
 
   if (transferStatus === "transferred") {
     const { data: refreshedPayment } = await supabase.from("payments").select("*").eq("id", payment.id).maybeSingle();
-    return initiateWorkerPayoutAfterTransfer(refreshedPayment || { ...payment, hubtel_transfer_status: transferStatus });
+    scheduleHubtelWorkerPayoutAfterTransfer((refreshedPayment || payment).id);
+    return { scheduled: true, transfer_reference: result.clientReference, status: transferStatus };
   }
 
   scheduleHubtelTransferStatusCheck(result.clientReference);
@@ -2106,8 +2127,7 @@ app.post("/webhooks/hubtel/transfer", async (req, res) => {
     });
 
     if (transferStatus === "transferred") {
-      const { data: refreshedPayment } = await supabase.from("payments").select("*").eq("id", payment.id).maybeSingle();
-      await initiateWorkerPayoutAfterTransfer(refreshedPayment || payment);
+      scheduleHubtelWorkerPayoutAfterTransfer(payment.id);
     }
 
     return res.json({ ok: true, status: transferStatus });

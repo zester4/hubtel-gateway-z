@@ -1325,13 +1325,16 @@ async function workerRecipientForPayment(payment) {
     };
 }
 
-async function initiateWorkerPayoutAfterTransfer(payment) {
+async function initiateWorkerPayoutAfterTransfer(payment, options = {}) {
   if (!payment?.id || !payment?.worker_user_id || Number(payment.worker_payout || 0) <= 0) return { skipped: true };
   const existingPayoutReference = String(payment.payout_reference || "");
+  const retryingFailedPayout =
+    options.allowRetryFailed === true &&
+    String(payment.status || "").toLowerCase() === "failed" &&
+    (existingPayoutReference.startsWith("zpo_") || payment.payout_external_id);
   if (
     payment.status === "paid_out" ||
-    existingPayoutReference.startsWith("zpo_") ||
-    payment.payout_external_id
+    ((existingPayoutReference.startsWith("zpo_") || payment.payout_external_id) && !retryingFailedPayout)
   ) {
     return { skipped: true, reason: "payout_already_started" };
   }
@@ -1375,7 +1378,7 @@ async function reconcileHubtelBalanceTransfer(reference) {
     hubtel_transfer_checked_at: new Date().toISOString(),
     hubtel_transfer_external_id: externalId != null ? String(externalId) : null,
     hubtel_transfer_failure_reason: failureReason,
-    status: transferStatus === "failed" ? "captured" : "processing",
+    status: payment.status === "paid_out" ? "paid_out" : "captured",
   };
   if (transferStatus === "transferred") {
     patch.hubtel_transfer_completed_at = new Date().toISOString();
@@ -1470,7 +1473,7 @@ async function initiateHubtelPayoutFunding(payment) {
   const externalId = data.id || data.Id || null;
   const failureReason = transferStatus === "failed" ? transferFailureReason(result.data) : null;
   await updatePaymentWithOptionalFields({ id: payment.id }, {
-    status: transferStatus === "failed" ? "captured" : "processing",
+    status: payment.status === "paid_out" ? "paid_out" : "captured",
     payout_provider: "hubtel_disbursement",
     hubtel_transfer_reference: result.clientReference,
     hubtel_transfer_external_id: externalId != null ? String(externalId) : null,
@@ -1630,6 +1633,58 @@ app.post("/api/disburse", requireGatewayToken, async (req, res) => {
       transaction_id: result.transactionId,
       client_reference: result.clientReference,
       raw: result.data,
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({ error: error.message, details: error.details });
+  }
+});
+
+app.post("/api/admin/payments/complete-worker-payout", requireGatewayToken, async (req, res) => {
+  try {
+    assertSupabaseAdminConfigured();
+    const paymentId = String(req.body?.payment_id || req.body?.paymentId || "").trim();
+    const allowRetryFailed = req.body?.allow_retry_failed === true || req.body?.allowRetryFailed === true;
+    if (!paymentId) return res.status(400).json({ error: "payment_id is required" });
+
+    const { data: payment, error } = await supabase
+      .from("payments")
+      .select("*")
+      .eq("id", paymentId)
+      .maybeSingle();
+    if (error) throw error;
+    if (!payment) return res.status(404).json({ error: "Payment not found" });
+    if (payment.collection_provider !== "hubtel_checkout") {
+      return res.status(400).json({ error: "Only Hubtel checkout shift payments can be resolved here" });
+    }
+    if (payment.status === "paid_out") {
+      return res.json({ ok: true, skipped: true, reason: "already_paid_out", payment });
+    }
+    if (!payment.worker_user_id) return res.status(400).json({ error: "Payment has no worker_user_id" });
+    if (Number(payment.worker_payout || 0) <= 0) return res.status(400).json({ error: "Payment has no worker payout amount" });
+    if (String(payment.hubtel_transfer_status || "").toLowerCase() !== "transferred") {
+      return res.status(409).json({ error: "Funding must be marked transferred before worker payout" });
+    }
+
+    const existingPayoutReference = String(payment.payout_reference || "");
+    const hasExistingPayout = existingPayoutReference.startsWith("zpo_") || Boolean(payment.payout_external_id);
+    if (hasExistingPayout && String(payment.status || "").toLowerCase() !== "failed") {
+      return res.status(409).json({ error: "A Hubtel worker payout already exists. Refresh its status before retrying." });
+    }
+    if (hasExistingPayout && !allowRetryFailed) {
+      return res.status(409).json({ error: "Existing payout failed. Submit allow_retry_failed=true to retry with a new reference." });
+    }
+
+    const result = await initiateWorkerPayoutAfterTransfer(payment, { allowRetryFailed });
+    const { data: refreshed } = await supabase
+      .from("payments")
+      .select("*")
+      .eq("id", paymentId)
+      .maybeSingle();
+
+    return res.json({
+      ok: true,
+      result,
+      payment: refreshed || payment,
     });
   } catch (error) {
     return res.status(error.status || 500).json({ error: error.message, details: error.details });
@@ -2117,8 +2172,9 @@ app.post("/webhooks/hubtel/transfer", async (req, res) => {
     const transferStatus = mapBalanceTransferStatus(payload);
     const externalId = data.id || data.Id || payment.hubtel_transfer_external_id || null;
     const failureReason = transferStatus === "failed" ? transferFailureReason(payload) : null;
+    const collectionStatus = payment.status === "paid_out" ? "paid_out" : "captured";
     await updatePaymentWithOptionalFields({ id: payment.id }, {
-      status: transferStatus === "failed" ? "failed" : "processing",
+      status: collectionStatus,
       hubtel_transfer_status: transferStatus,
       hubtel_transfer_external_id: externalId != null ? String(externalId) : null,
       hubtel_transfer_checked_at: new Date().toISOString(),

@@ -4,7 +4,7 @@ import { createClient } from "@supabase/supabase-js";
 
 const router = express.Router();
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+let supabaseClient = null;
 
 function assertSupabaseAdminConfigured() {
   const key = String(process.env.SUPABASE_SERVICE_ROLE_KEY || "");
@@ -14,6 +14,14 @@ function assertSupabaseAdminConfigured() {
   if (key.startsWith("sb_publishable_") || key.startsWith("sb_anon_")) {
     throw new Error("SUPABASE_SERVICE_ROLE_KEY must be a secret/service-role key, not a publishable/anon key");
   }
+}
+
+function db() {
+  assertSupabaseAdminConfigured();
+  if (!supabaseClient) {
+    supabaseClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+  }
+  return supabaseClient;
 }
 
 function requireGatewayToken(req, res, next) {
@@ -139,7 +147,7 @@ function extractCallbackIds(payload) {
 }
 
 async function updatePromotionWithOptionalFields(matcher, patch) {
-  const { error } = await supabase.from("profile_promotions").update(patch).match(matcher);
+  const { error } = await db().from("profile_promotions").update(patch).match(matcher);
   if (error?.code === "42703" || error?.code === "PGRST204") {
     const fallback = { ...patch };
     delete fallback.checkout_url;
@@ -147,7 +155,7 @@ async function updatePromotionWithOptionalFields(matcher, patch) {
     delete fallback.checkout_id;
     delete fallback.status;
     delete fallback.promoted_until;
-    const { error: fallbackError } = await supabase.from("profile_promotions").update(fallback).match(matcher);
+    const { error: fallbackError } = await db().from("profile_promotions").update(fallback).match(matcher);
     if (fallbackError) throw fallbackError;
   } else if (error) {
     throw error;
@@ -155,7 +163,7 @@ async function updatePromotionWithOptionalFields(matcher, patch) {
 }
 
 async function insertPromotionWithOptionalFields(patch) {
-  const { data, error } = await supabase.from("profile_promotions").insert(patch).select("*").single();
+  const { data, error } = await db().from("profile_promotions").insert(patch).select("*").single();
   if (error?.code === "42703" || error?.code === "PGRST204") {
     const fallback = { ...patch };
     delete fallback.checkout_url;
@@ -163,7 +171,7 @@ async function insertPromotionWithOptionalFields(patch) {
     delete fallback.checkout_id;
     delete fallback.status;
     delete fallback.promoted_until;
-    const fallbackRes = await supabase.from("profile_promotions").insert(fallback).select("*").single();
+    const fallbackRes = await db().from("profile_promotions").insert(fallback).select("*").single();
     if (fallbackRes.error) throw fallbackRes.error;
     return fallbackRes.data;
   }
@@ -177,7 +185,7 @@ async function markPromoted(row) {
   promotedUntil.setDate(promotedUntil.getDate() + 7);
   const promotedUntilIso = promotedUntil.toISOString();
 
-  const { error: workerError } = await supabase
+  const { error: workerError } = await db()
     .from("workers")
     .update({ promoted_until: promotedUntilIso })
     .eq("user_id", row.worker_user_id);
@@ -191,7 +199,7 @@ async function markPromoted(row) {
 }
 
 async function lookupPromotion({ workerUserId, reference, checkoutId }) {
-  let query = supabase
+  let query = db()
     .from("profile_promotions")
     .select("*")
     .eq("provider", "hubtel")

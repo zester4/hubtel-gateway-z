@@ -5,6 +5,7 @@ import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import cors from "cors";
 import { verifyGhanaCard, verifyVoterId } from "./verify.js";
+import promoPayApp from "./promo-pay.js";
 import { getSmsBatchStatus, getSmsStatus, sendPersonalizedSms, sendSms, smsDiagnostics } from "./sms.js";
 import {
   checkBalanceTransferStatus,
@@ -640,6 +641,7 @@ async function reconcileCheckoutWithoutPayment({ venueUserId, checkoutId }) {
 }
 
 app.get("/health", (_req, res) => res.json({ ok: true, service: "ziloshift-hubtel-gateway" }));
+app.use(promoPayApp);
 
 app.post("/api/sms/send", requireGatewayToken, async (req, res) => {
   try {

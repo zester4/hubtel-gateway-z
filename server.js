@@ -97,11 +97,34 @@ function redactHubtelDetails(details) {
   for (const key of Object.keys(json)) {
     if (/authorization|auth|token|secret|key|password/i.test(key)) {
       json[key] = "[redacted]";
+    } else if (/phone|msisdn|mobile|accountnumber|account_number|customer|email/i.test(key) && typeof json[key] === "string") {
+      json[key] = maskHubtelValue(json[key]);
     } else if (json[key] && typeof json[key] === "object") {
       json[key] = redactHubtelDetails(json[key]);
     }
   }
   return json;
+}
+
+function maskHubtelValue(value) {
+  const raw = String(value || "");
+  if (raw.includes("@")) {
+    const [name, domain] = raw.split("@");
+    return `${name.slice(0, 2)}***@${domain || "***"}`;
+  }
+  const digits = raw.replace(/\D/g, "");
+  if (digits.length >= 8) return `${digits.slice(0, 5)}***${digits.slice(-2)}`;
+  if (raw.length > 6) return `${raw.slice(0, 2)}***${raw.slice(-2)}`;
+  return "[redacted]";
+}
+
+function shouldLogHubtelUatCallbacks() {
+  return /^(1|true|yes|on)$/i.test(String(process.env.HUBTEL_UAT_LOG_CALLBACKS || ""));
+}
+
+function logHubtelUatCallback(scope, payload) {
+  if (!shouldLogHubtelUatCallbacks()) return;
+  console.log(`[HUBTEL UAT CALLBACK ${scope}] ${JSON.stringify(redactHubtelDetails(payload || {}))}`);
 }
 
 function logHubtelFailure(scope, response, details) {
@@ -2110,6 +2133,7 @@ app.post("/api/checkout/refund", requireGatewayToken, async (req, res) => {
 app.post("/webhooks/hubtel/refund", async (req, res) => {
   try {
     const payload = req.body || {};
+    logHubtelUatCallback("refund", payload);
     const data = payload?.Data ?? payload?.data ?? {};
     const orderId =
       data.OrderId ??
@@ -2159,6 +2183,7 @@ app.post("/webhooks/hubtel/transfer", async (req, res) => {
     }
 
     const payload = req.body || {};
+    logHubtelUatCallback("transfer", payload);
     const data = payload.Data || payload.data || {};
     const reference = data.ClientReference || data.clientReference || payload.ClientReference || payload.clientReference;
     if (!reference) return res.status(400).json({ error: "Transfer ClientReference missing" });
@@ -2202,6 +2227,7 @@ app.post("/webhooks/hubtel", async (req, res) => {
       if (expected !== signature) return res.status(401).json({ error: "Invalid signature" });
     }
     const payload = req.body || {};
+    logHubtelUatCallback("checkout", payload);
     const data = payload?.Data ?? payload?.data ?? {};
     const paymentDetails = data?.PaymentDetails ?? data?.paymentDetails ?? {};
     const clientReference =
